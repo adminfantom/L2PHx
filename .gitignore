@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+logs/
+*.log
+
+# WinDivert binaries - must be downloaded separately
+WinDivert.dll
+WinDivert64.sys
