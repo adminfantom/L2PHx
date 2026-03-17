@@ -38,8 +38,6 @@ from typing import Optional, Tuple, Dict, Any
 # Конфигурация
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ДИАГНОСТИКА: 7777 убран — клиент пойдёт напрямую к game server
-# Если заработает — значит прокси мешает подключению к 7777
 GAME_PORTS = {2106, 17453} | set(range(7900, 7921))
 PROXY_PORT = 17777
 LISTEN_HOST = "0.0.0.0"
@@ -400,6 +398,30 @@ def parse_key_init(body: bytes) -> Optional[Dict[str, Any]]:
              f"proto={result['protocol_version']} bf_key={result.get('bf_key', b'').hex()}")
         return result
 
+    elif 24 <= len(body) < 153:
+        # Средний формат (Intermediate) — нет RSA, но есть BF key
+        # op(1) + session_id(4) + proto_ver(4) + [game_guard?] + bf_key
+        result["format"] = "intermediate"
+        result["session_id"] = struct.unpack_from("<I", body, 1)[0]
+        result["protocol_version"] = struct.unpack_from("<I", body, 5)[0]
+        # BF key в конце пакета (последние 16-21 байт) или сразу после заголовка
+        # Пробуем: всё после заголовка (9 байт) как crypto material
+        crypto_data = body[9:]
+        if len(crypto_data) >= 21:
+            # Если достаточно данных — берём последние 21 байт как BF key (как Ertheia)
+            result["bf_key"] = crypto_data[-21:]
+            result["xor_key"] = result["bf_key"][:8]
+        elif len(crypto_data) >= 16:
+            result["bf_key"] = crypto_data[-16:]
+            result["xor_key"] = result["bf_key"][:8]
+        elif len(crypto_data) >= 8:
+            result["bf_key"] = crypto_data[:min(len(crypto_data), 21)]
+            result["xor_key"] = crypto_data[:8]
+        _dbg(f"[KEYINIT] Intermediate format! session=0x{result['session_id']:08X} "
+             f"proto={result['protocol_version']} crypto_data={len(crypto_data)}b "
+             f"bf_key={result.get('bf_key', b'').hex()}")
+        return result
+
     elif 15 <= len(body) <= 23:
         # Короткий формат (Freya) — строго 15-23 байт (xorKey+serverId+obfKey)
         result["format"] = "freya"
@@ -413,7 +435,7 @@ def parse_key_init(body: bytes) -> Optional[Dict[str, Any]]:
         return result
 
     # Не KeyInit — слишком мало/много для Freya, мало для Ertheia
-    _dbg(f"[KEYINIT] NOT a KeyInit: size={len(body)} (need >=153 for Ertheia or 15-23 for Freya)")
+    _dbg(f"[KEYINIT] NOT a KeyInit: size={len(body)} (need >=153 for Ertheia, 24-152 for Intermediate, or 15-23 for Freya)")
     return None
 
 
@@ -528,6 +550,11 @@ class L2CryptoSession:
         self.key_init_data: Optional[dict] = None
         self.initialized = False
         self.passthrough = False  # True = no crypto, forward raw
+        # Shadow crypto — для пассивной расшифровки без модификации потока
+        self.shadow_enabled = False
+        self.shadow_bf: Optional[L2BlowfishCipher] = None
+        self.shadow_xor_s2c: Optional[L2XorCipher] = None
+        self.shadow_xor_c2s: Optional[L2XorCipher] = None
 
     def init_from_key_init(self, body: bytes) -> Optional[dict]:
         """Инициализировать крипто из KeyInit пакета."""
@@ -542,6 +569,9 @@ class L2CryptoSession:
         if bf_key:
             self.bf_key = bytes(bf_key)
             self.bf.set_key(self.bf_key)
+            # Shadow BF — отдельный экземпляр для пассивной расшифровки
+            self.shadow_bf = L2BlowfishCipher()
+            self.shadow_bf.set_key(self.bf_key)
 
         if xor_key:
             self.xor_key = bytes(xor_key)
@@ -550,8 +580,36 @@ class L2CryptoSession:
             self.server_s2c = L2XorCipher(self.xor_key, interlude=True)
             self.client_s2c = L2XorCipher(self.xor_key, interlude=True)
             self.initialized = True
+            # Shadow XOR — отдельные экземпляры для пассивной расшифровки
+            self.shadow_xor_s2c = L2XorCipher(self.xor_key, interlude=True)
+            self.shadow_xor_c2s = L2XorCipher(self.xor_key, interlude=True)
+            self.shadow_enabled = True
 
         return info
+
+    def shadow_decrypt_s2c(self, body: bytes) -> Optional[bytes]:
+        """Пассивная расшифровка S→C (не влияет на основной поток)."""
+        if not self.shadow_bf:
+            return None
+        try:
+            dec = self.shadow_bf.decrypt(body)
+            if self.shadow_xor_s2c:
+                dec = self.shadow_xor_s2c.decrypt(dec)
+            return dec
+        except Exception:
+            return None
+
+    def shadow_decrypt_c2s(self, body: bytes) -> Optional[bytes]:
+        """Пассивная расшифровка C→S (не влияет на основной поток)."""
+        if not self.shadow_bf:
+            return None
+        try:
+            dec = self.shadow_bf.decrypt(body)
+            if self.shadow_xor_c2s:
+                dec = self.shadow_xor_c2s.decrypt(dec)
+            return dec
+        except Exception:
+            return None
 
     def decrypt_s2c(self, body: bytes) -> bytes:
         """Расшифровать S→C пакет: BF → XOR (server_s2c state)."""
@@ -690,16 +748,12 @@ class L2MitmProxy:
                     if not info:
                         self.crypto.passthrough = True
                         _dbg(f"[S2C] No KeyInit (op=0x{body[0]:02X} size={len(body)}), passthrough mode")
-                    elif self._target_port != 7777:
-                        # Login(2106)/Intermediate(17453): BF-ONLY, нет XOR!
-                        # Наша криптосистема предполагает BF+XOR — passthrough безопаснее.
-                        self.crypto.passthrough = True
-                        _dbg(f"[S2C] Port {self._target_port} != 7777: BF-only protocol, PASSTHROUGH mode "
-                             f"(format={info.get('format')} session=0x{info.get('session_id',0):08X})")
                     else:
-                        _dbg(f"[S2C] KeyInit OK on game port 7777: "
-                             f"format={info.get('format')} session=0x{info.get('session_id',0):08X} "
-                             f"FULL CRYPTO (BF+XOR) enabled")
+                        # Passthrough для пересылки, но shadow crypto для расшифровки копий
+                        self.crypto.passthrough = True
+                        shadow = "SHADOW CRYPTO ON" if self.crypto.shadow_enabled else "NO SHADOW"
+                        _dbg(f"[S2C] Port {self._target_port}: PASSTHROUGH + {shadow} "
+                             f"(format={info.get('format')} session=0x{info.get('session_id',0):08X})")
                     opcode, opname = decode_opcode(body, "S2C")
                     self.store.add("S2C", body, body, opcode, opname,
                                    extra={"key_init": {
@@ -711,16 +765,22 @@ class L2MitmProxy:
                     _dbg(f"[S2C] KeyInit forwarded to client, relay continues...")
                     continue
 
-                # Passthrough — просто пересылаем как есть
+                # Passthrough — пересылаем как есть, но пробуем shadow decrypt
                 if self.crypto.passthrough:
-                    opcode, opname = decode_opcode(body, "S2C")
-                    _dbg(f"[S2C PASS] #{n} len={len(body)} op=0x{body[0]:02X}")
-                    self.store.add("S2C", body, body, opcode, opname)
+                    dec_body = body  # по умолчанию — raw
+                    if self.crypto.shadow_enabled:
+                        shadow_dec = self.crypto.shadow_decrypt_s2c(body)
+                        if shadow_dec:
+                            dec_body = shadow_dec
+                            _dbg(f"[S2C SHADOW] #{n} len={len(body)} dec_op=0x{shadow_dec[0]:02X}")
+                    opcode, opname = decode_opcode(dec_body, "S2C")
+                    _dbg(f"[S2C PASS] #{n} len={len(body)} op=0x{opcode:04X}({opname})")
+                    self.store.add("S2C", body, dec_body, opcode, opname)
                     with self._client_lock:
                         send_l2_packet(self.client_sock, body)
                     continue
 
-                # Расшифровать от сервера
+                # Full MITM: расшифровать от сервера
                 try:
                     plaintext = self.crypto.decrypt_s2c(body)
                 except Exception as e:
@@ -804,16 +864,22 @@ class L2MitmProxy:
                     _dbg(f"[C2S DEBUG] send_l2_packet OK (total {len(body)+2} bytes)")
                     continue
 
-                # Passthrough — просто пересылаем как есть
+                # Passthrough — пересылаем как есть, но пробуем shadow decrypt
                 if self.crypto.passthrough:
-                    opcode, opname = decode_opcode(body, "C2S")
-                    _dbg(f"[C2S PASS] #{n} len={len(body)} op=0x{body[0]:02X}")
-                    self.store.add("C2S", body, body, opcode, opname)
+                    dec_body = body
+                    if self.crypto.shadow_enabled:
+                        shadow_dec = self.crypto.shadow_decrypt_c2s(body)
+                        if shadow_dec:
+                            dec_body = shadow_dec
+                            _dbg(f"[C2S SHADOW] #{n} len={len(body)} dec_op=0x{shadow_dec[0]:02X}")
+                    opcode, opname = decode_opcode(dec_body, "C2S")
+                    _dbg(f"[C2S PASS] #{n} len={len(body)} op=0x{opcode:04X}({opname})")
+                    self.store.add("C2S", body, dec_body, opcode, opname)
                     with self._server_lock:
                         send_l2_packet(self.server_sock, body)
                     continue
 
-                # Расшифровать от клиента
+                # Full MITM: расшифровать от клиента
                 try:
                     plaintext = self.crypto.decrypt_c2s(body)
                 except Exception as e:
@@ -938,12 +1004,10 @@ class L2MitmProxy:
                         if not info:
                             crypto.passthrough = True
                             _dbg(f"[S2C:{target_port}] No KeyInit (op=0x{body[0]:02X} size={len(body)}), passthrough")
-                        elif target_port != 7777:
-                            crypto.passthrough = True
-                            _dbg(f"[S2C:{target_port}] BF-only protocol, PASSTHROUGH "
-                                 f"(session=0x{info.get('session_id',0):08X})")
                         else:
-                            _dbg(f"[S2C:{target_port}] FULL CRYPTO BF+XOR "
+                            crypto.passthrough = True
+                            shadow = "SHADOW ON" if crypto.shadow_enabled else "NO SHADOW"
+                            _dbg(f"[S2C:{target_port}] PASSTHROUGH + {shadow} "
                                  f"(session=0x{info.get('session_id',0):08X})")
                         opcode, opname = decode_opcode(body, "S2C")
                         self.store.add("S2C", body, body, opcode, opname,
@@ -957,9 +1021,14 @@ class L2MitmProxy:
                         continue
 
                     if crypto.passthrough:
-                        _dbg(f"[S2C:{target_port}] #{n} PASS len={len(body)} op=0x{body[0]:02X}")
-                        opcode, opname = decode_opcode(body, "S2C")
-                        self.store.add("S2C", body, body, opcode, opname)
+                        dec_body = body
+                        if crypto.shadow_enabled:
+                            shadow_dec = crypto.shadow_decrypt_s2c(body)
+                            if shadow_dec:
+                                dec_body = shadow_dec
+                        opcode, opname = decode_opcode(dec_body, "S2C")
+                        _dbg(f"[S2C:{target_port}] #{n} PASS len={len(body)} op=0x{opcode:04X}({opname})")
+                        self.store.add("S2C", body, dec_body, opcode, opname)
                         with client_lock:
                             send_l2_packet(client_sock, body)
                         continue
@@ -1035,9 +1104,14 @@ class L2MitmProxy:
                         continue
 
                     if crypto.passthrough:
-                        _dbg(f"[C2S:{target_port}] #{n} PASS len={len(body)} op=0x{body[0]:02X}")
-                        opcode, opname = decode_opcode(body, "C2S")
-                        self.store.add("C2S", body, body, opcode, opname)
+                        dec_body = body
+                        if crypto.shadow_enabled:
+                            shadow_dec = crypto.shadow_decrypt_c2s(body)
+                            if shadow_dec:
+                                dec_body = shadow_dec
+                        opcode, opname = decode_opcode(dec_body, "C2S")
+                        _dbg(f"[C2S:{target_port}] #{n} PASS len={len(body)} op=0x{opcode:04X}({opname})")
+                        self.store.add("C2S", body, dec_body, opcode, opname)
                         with server_lock:
                             send_l2_packet(server_sock, body)
                         continue
@@ -1569,6 +1643,168 @@ class WinDivertRedirector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WinDivert Passive Sniffer — порт 7777 (копия трафика без перехвата)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SNIFF_PORTS = {7777}  # Порты для пассивного сниффинга
+
+class WinDivertSniffer:
+    """Пассивный захват TCP-трафика через WinDivert SNIFF mode.
+
+    НЕ перехватывает пакеты — только читает копии. Игра работает нормально.
+    Извлекает TCP payload, реассемблирует L2 пакеты из потока.
+    """
+
+    def __init__(self, store: PacketStore, ports=None):
+        self.store = store
+        self.ports = ports or SNIFF_PORTS
+        self.running = False
+        # TCP stream буферы: (src_ip, src_port, dst_ip, dst_port) → bytearray
+        self._streams: Dict[tuple, bytearray] = {}
+        self._stream_dirs: Dict[tuple, str] = {}  # stream_key → "C2S"/"S2C"
+        self._game_server_ip: Optional[str] = None
+        self._pkt_count = 0
+
+    def _extract_tcp_payload(self, raw: bytes) -> Optional[tuple]:
+        """Извлечь TCP payload из IP пакета. Возвращает (info, payload) или None."""
+        info = _parse_ipv4_packet(raw)
+        if not info:
+            return None
+        tcp_off = info["tcp_off"]
+        # TCP data offset (верхние 4 бита байта 12 заголовка TCP)
+        if len(raw) < tcp_off + 13:
+            return None
+        tcp_data_off = ((raw[tcp_off + 12] >> 4) & 0x0F) * 4
+        payload_start = tcp_off + tcp_data_off
+        if payload_start >= len(raw):
+            return info, b""
+        return info, raw[payload_start:]
+
+    def _get_stream_key(self, info: dict) -> tuple:
+        return (info["src_ip"], info["src_port"], info["dst_ip"], info["dst_port"])
+
+    def _determine_direction(self, info: dict) -> str:
+        """Определить направление: C2S или S2C."""
+        # Если dst_port в sniff ports — клиент шлёт серверу
+        if info["dst_port"] in self.ports:
+            return "C2S"
+        return "S2C"
+
+    def _process_stream(self, stream_key: tuple, direction: str):
+        """Извлечь L2 пакеты из TCP буфера."""
+        buf = self._streams.get(stream_key)
+        if not buf or len(buf) < 2:
+            return
+
+        while len(buf) >= 2:
+            pkt_len = struct.unpack_from("<H", buf)[0]
+            if pkt_len < 3 or pkt_len > 65535:
+                # Битые данные — сбросить буфер
+                _dbg(f"[SNIFF:7777] Bad pkt_len={pkt_len}, flushing {len(buf)} bytes ({direction})")
+                buf.clear()
+                break
+            if len(buf) < pkt_len:
+                break  # Ждём остаток пакета
+
+            body = bytes(buf[2:pkt_len])
+            del buf[:pkt_len]
+
+            # Декодируем опкод из сырых данных
+            opcode = body[0] if body else -1
+            opname = f"0x{opcode:02X}" if opcode >= 0 else "?"
+
+            # Детекция KeyInit
+            extra = {}
+            ki = parse_key_init(body)
+            if ki:
+                extra["key_init"] = {
+                    k: v.hex() if isinstance(v, (bytes, bytearray)) else v
+                    for k, v in ki.items()
+                }
+                _dbg(f"[SNIFF:7777] KeyInit detected! session=0x{ki.get('session_id',0):08X} "
+                     f"bf_key={'yes' if ki.get('bf_key') else 'no'}")
+
+            tag = f"SNIFF:{direction}"
+            _dbg(f"[SNIFF:7777] {direction} op=0x{opcode:02X} len={len(body)}")
+            self.store.add(direction, body, body, opcode, f"sniff:{opname}", extra=extra)
+
+    def run(self):
+        wd = WinDivert2()
+        try:
+            wd._load_dll()
+        except Exception as e:
+            print(f"[SNIFF] DLL error: {e}", file=sys.stderr)
+            return
+
+        port_cond = " or ".join(
+            f"tcp.DstPort == {p} or tcp.SrcPort == {p}" for p in sorted(self.ports))
+        filt = f"ip and tcp and ({port_cond})"
+
+        try:
+            wd.open(filt, flags=WINDIVERT_FLAG_SNIFF)
+        except OSError as e:
+            print(f"[SNIFF] FAILED: {e}", file=sys.stderr)
+            return
+
+        self.running = True
+        print(f"[SNIFF] Passive capture on ports {sorted(self.ports)} (SNIFF mode, no interception)",
+              file=sys.stderr)
+
+        try:
+            while self.running:
+                try:
+                    raw, addr = wd.recv()
+                except OSError as e:
+                    if self.running:
+                        print(f"[SNIFF] recv: {e}", file=sys.stderr)
+                    continue
+
+                result = self._extract_tcp_payload(raw)
+                if not result:
+                    continue
+                info, payload = result
+
+                if not payload:
+                    # SYN/ACK/FIN без данных
+                    tcp_off = info["tcp_off"]
+                    tcp_flags = raw[tcp_off + 13] if len(raw) > tcp_off + 13 else 0
+                    is_syn = bool(tcp_flags & 0x02) and not bool(tcp_flags & 0x10)
+                    is_fin_rst = bool(tcp_flags & 0x05)
+
+                    if is_syn:
+                        direction = self._determine_direction(info)
+                        _dbg(f"[SNIFF:7777] SYN {direction} "
+                             f"{info['src_ip']}:{info['src_port']}→{info['dst_ip']}:{info['dst_port']}")
+                    if is_fin_rst:
+                        # Очистить буферы потока
+                        key = self._get_stream_key(info)
+                        rev_key = (info["dst_ip"], info["dst_port"], info["src_ip"], info["src_port"])
+                        self._streams.pop(key, None)
+                        self._streams.pop(rev_key, None)
+                    continue
+
+                self._pkt_count += 1
+                direction = self._determine_direction(info)
+                stream_key = self._get_stream_key(info)
+
+                if stream_key not in self._streams:
+                    self._streams[stream_key] = bytearray()
+                    self._stream_dirs[stream_key] = direction
+
+                self._streams[stream_key].extend(payload)
+                self._process_stream(stream_key, direction)
+
+        except Exception as e:
+            if self.running:
+                print(f"[SNIFF] Error: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+        finally:
+            wd.close()
+            print(f"[SNIFF] Closed (raw_pkts={self._pkt_count})", file=sys.stderr)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Packet Builder Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1912,6 +2148,10 @@ def main():
         threading.Thread(
             target=WinDivertRedirector(args.port).run,
             daemon=True, name="divert").start()
+        # Пассивный сниффер для порта 7777 (без перехвата)
+        threading.Thread(
+            target=WinDivertSniffer(store).run,
+            daemon=True, name="sniff-7777").start()
 
     if args.mode in ("mcp", "all"):
         asyncio.run(mcp.run())

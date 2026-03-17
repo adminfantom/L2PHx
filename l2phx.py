@@ -1071,6 +1071,9 @@ def main():
     if args.divert:
         divert = engine.WinDivertRedirector(engine.PROXY_PORT)
         threading.Thread(target=divert.run, daemon=True, name="divert").start()
+        # Пассивный сниффер порта 7777 (без перехвата)
+        sniffer = engine.WinDivertSniffer(store)
+        threading.Thread(target=sniffer.run, daemon=True, name="sniff-7777").start()
     else:
         print("[DIVERT] Off (use --divert)", file=sys.stderr)
 
