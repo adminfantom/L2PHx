@@ -9,13 +9,19 @@ L2 MCP Proxy v3 — Lineage 2 MITM-перехватчик пакетов + MCP �
                                                               ↕
                                                         Claude Agent
 
-Крипто-пайплайн (Ertheia+):
-  Отправка (C→S): plaintext → XOR encrypt → Blowfish ECB encrypt → TCP
-  Приём   (S→C): TCP → Blowfish ECB decrypt → XOR decrypt → plaintext
-  KeyInit (0x2E, первый S→C) всегда в открытом виде.
+Крипто-пайплайн:
+  Порт 17453 (Intermediate/Queue): Ertheia+ BF+XOR шифрование.
+    Отправка (C→S): plaintext → XOR encrypt → Blowfish ECB encrypt → TCP
+    Приём   (S→C): TCP → Blowfish ECB decrypt → XOR decrypt → plaintext
+    KeyInit (0x2E, первый S→C) всегда в открытом виде.
 
-Для инъекции используются 4 независимых XOR state (client_c2s, server_c2s,
-server_s2c, client_s2c) с полным re-encrypt обоих направлений.
+  Порт 7777 (Game World): PLAINTEXT — шифрование ОТСУТСТВУЕТ.
+    FBlowFish в Core.dll — stripped stub (RVA в uninitialized memory).
+    Engine.dll / WinDrv.dll НЕ содержат крипто-кода для сетевого трафика.
+    Пакеты: [2b LE length] [1-3b opcode] [body]
+    Опкоды: 0x01-0xFD=1 байт, 0xFE+LE16=ExOp, 0xD0+LE16=ExOp2.
+
+Для инъекции на 17453 используются 4 независимых XOR state.
 
 Авторизованный пентест Innova/4Game, Dec 2025 - Mar 2026.
 """
@@ -280,6 +286,49 @@ _custom_c2s_ex: Dict[int, str] = {}
 _custom_s2c_ex: Dict[int, str] = {}
 
 
+def load_opcodes_from_json(json_path: str):
+    """Загрузить S2C опкоды из JSON-дампа памяти L2 клиента.
+
+    Файл создаётся opcode_dumper.dll (injection через DSETUP.dll proxy).
+    Содержит main_opcodes (0x00-0xFF) и ex_opcodes (0x0000-0x03CC).
+    """
+    global S2C_OPCODES, S2C_EX
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        loaded_main = 0
+        for hex_op, name in data.get("main_opcodes", {}).items():
+            op = int(hex_op, 16)
+            S2C_OPCODES[op] = name
+            loaded_main += 1
+
+        loaded_ex = 0
+        for hex_op, name in data.get("ex_opcodes", {}).items():
+            op = int(hex_op, 16)
+            S2C_EX[op] = name
+            loaded_ex += 1
+
+        print(f"[OPCODES] JSON dump: {loaded_main} main + {loaded_ex} ex S2C from {json_path}",
+              file=sys.stderr)
+    except FileNotFoundError:
+        print(f"[OPCODES] JSON not found: {json_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"[OPCODES] Error loading JSON {json_path}: {e}", file=sys.stderr)
+
+
+# Автозагрузка опкодов из дампа (ищем рядом с собой и в стандартных путях)
+_OPCODE_JSON_PATHS = [
+    os.path.join(_APP_DIR, "l2_opcodes.json"),
+    os.path.join(_APP_DIR, "..", "..", "..", "_данные", "дампы", "l2_opcodes.json"),
+    r"D:\tmp\l2_opcodes.json",
+]
+for _p in _OPCODE_JSON_PATHS:
+    if os.path.isfile(_p):
+        load_opcodes_from_json(_p)
+        break
+
+
 def load_opcodes_from_ini(ini_path: str):
     """Загрузить опкоды из PacketsXXX.ini (формат L2PHx).
 
@@ -382,8 +431,9 @@ def parse_key_init(body: bytes) -> Optional[Dict[str, Any]]:
     _dbg(f"[KEYINIT] parse_key_init: op=0x{actual_op:02X} size={len(body)}")
     result = {"opcode": actual_op, "format": "unknown", "body_size": len(body)}
 
-    if len(body) >= 153:
+    if 153 <= len(body) <= 1024:
         # Длинный формат (Ertheia+ с RSA) — опкод обфусцирован, определяем по размеру
+        # KeyInit 153-1024 байт. Современные версии могут иметь расширенные ключи.
         result["format"] = "ertheia"
         result["session_id"] = struct.unpack_from("<I", body, 1)[0]
         result["protocol_version"] = struct.unpack_from("<I", body, 5)[0]
@@ -1662,6 +1712,9 @@ class WinDivertSniffer:
         # TCP stream буферы: (src_ip, src_port, dst_ip, dst_port) → bytearray
         self._streams: Dict[tuple, bytearray] = {}
         self._stream_dirs: Dict[tuple, str] = {}  # stream_key → "C2S"/"S2C"
+        self._stream_pkt_count: Dict[tuple, int] = {}  # кол-во L2 пакетов в потоке
+        self._stream_crypto: Dict[tuple, CryptoState] = {}  # крипто per-stream
+        self._stream_ki_found: Dict[tuple, bool] = {}  # KeyInit найден per-stream
         self._game_server_ip: Optional[str] = None
         self._pkt_count = 0
 
@@ -1690,8 +1743,80 @@ class WinDivertSniffer:
             return "C2S"
         return "S2C"
 
+    @staticmethod
+    def _parse_opcode(body: bytes, direction: str = "S2C") -> tuple:
+        """Парсит L2 опкод из plaintext body.
+
+        Формат опкодов (Samurai Crow / modern L2 Main):
+          - 1 байт: 0x01-0xFD  → opcode = body[0]
+          - 0xFE + LE16 → extended opcode (S2C ExOpcode)
+          - 0xD0 + LE16 → extended opcode (C2S ExOpcode)
+
+        Использует загруженные таблицы (S2C из JSON дампа, C2S из INI/hardcoded).
+        Возвращает (full_opcode: int, opname: str, header_size: int).
+        """
+        if not body:
+            return (-1, "EMPTY", 0)
+        first = body[0]
+        if first == 0xFE and len(body) >= 3:
+            sub = struct.unpack_from("<H", body, 1)[0]
+            full = 0xFE0000 | sub
+            name = S2C_EX.get(sub) or _custom_s2c_ex.get(sub) or f"0xFE:{sub:04X}"
+            return (full, name, 3)
+        if first == 0xD0 and len(body) >= 3:
+            sub = struct.unpack_from("<H", body, 1)[0]
+            full = 0xD00000 | sub
+            if direction == "C2S":
+                name = C2S_EX.get(sub) or _custom_c2s_ex.get(sub) or f"0xD0:{sub:04X}"
+            else:
+                name = S2C_EX.get(sub) or _custom_s2c_ex.get(sub) or f"0xD0:{sub:04X}"
+            return (full, name, 3)
+        # Main opcode
+        if direction == "C2S":
+            name = C2S_OPCODES.get(first) or _custom_c2s.get(first) or f"0x{first:02X}"
+        else:
+            name = S2C_OPCODES.get(first) or _custom_s2c.get(first) or f"0x{first:02X}"
+        return (first, name, 1)
+
+    @staticmethod
+    def _try_extract_strings(body: bytes, hdr_size: int) -> list:
+        """Пытается извлечь UTF-16LE строки из тела пакета (plaintext).
+
+        Ищет null-terminated UTF-16LE последовательности >= 2 символов.
+        """
+        strings = []
+        data = body[hdr_size:]
+        i = 0
+        while i < len(data) - 1:
+            # Ищем начало возможной UTF-16LE строки
+            j = i
+            chars = []
+            while j + 1 < len(data):
+                cp = struct.unpack_from("<H", data, j)[0]
+                if cp == 0:  # null terminator
+                    j += 2
+                    break
+                if 0x20 <= cp < 0xD800 or 0xE000 <= cp < 0xFFFE:
+                    chars.append(chr(cp))
+                    j += 2
+                else:
+                    break
+            if len(chars) >= 2:
+                strings.append("".join(chars))
+                i = j
+            else:
+                i += 1
+        return strings[:5]  # Максимум 5 строк
+
     def _process_stream(self, stream_key: tuple, direction: str):
-        """Извлечь L2 пакеты из TCP буфера."""
+        """Извлечь L2 пакеты из TCP буфера.
+
+        Современный L2 Main (Samurai Crow) НЕ использует Blowfish/XOR шифрование.
+        FBlowFish в Core.dll — stripped stub. Ни Engine.dll, ни WinDrv.dll не содержат
+        крипто-кода для сетевого трафика. Пакеты идут в plaintext.
+
+        Формат: [2b LE length (включая эти 2 байта)] [1-3b opcode] [body]
+        """
         buf = self._streams.get(stream_key)
         if not buf or len(buf) < 2:
             return
@@ -1699,7 +1824,6 @@ class WinDivertSniffer:
         while len(buf) >= 2:
             pkt_len = struct.unpack_from("<H", buf)[0]
             if pkt_len < 3 or pkt_len > 65535:
-                # Битые данные — сбросить буфер
                 _dbg(f"[SNIFF:7777] Bad pkt_len={pkt_len}, flushing {len(buf)} bytes ({direction})")
                 buf.clear()
                 break
@@ -1709,23 +1833,31 @@ class WinDivertSniffer:
             body = bytes(buf[2:pkt_len])
             del buf[:pkt_len]
 
-            # Декодируем опкод из сырых данных
-            opcode = body[0] if body else -1
-            opname = f"0x{opcode:02X}" if opcode >= 0 else "?"
+            # Считаем пакеты в потоке
+            if stream_key not in self._stream_pkt_count:
+                self._stream_pkt_count[stream_key] = 0
+            self._stream_pkt_count[stream_key] += 1
+            pkt_num = self._stream_pkt_count[stream_key]
 
-            # Детекция KeyInit
-            extra = {}
-            ki = parse_key_init(body)
-            if ki:
-                extra["key_init"] = {
-                    k: v.hex() if isinstance(v, (bytes, bytearray)) else v
-                    for k, v in ki.items()
-                }
-                _dbg(f"[SNIFF:7777] KeyInit detected! session=0x{ki.get('session_id',0):08X} "
-                     f"bf_key={'yes' if ki.get('bf_key') else 'no'}")
+            # Plaintext: парсим опкод напрямую
+            opcode, opname, hdr_size = self._parse_opcode(body, direction)
+            extra = {"plaintext": True, "hdr_size": hdr_size, "body_len": len(body)}
 
-            tag = f"SNIFF:{direction}"
-            _dbg(f"[SNIFF:7777] {direction} op=0x{opcode:02X} len={len(body)}")
+            # Пытаемся извлечь UTF-16LE строки из тела
+            strings = self._try_extract_strings(body, hdr_size)
+            if strings:
+                extra["strings"] = strings
+
+            # Первые 20 пакетов каждого потока логируем подробно
+            if pkt_num <= 20:
+                hex_preview = body[:32].hex() if body else ""
+                _dbg(f"[SNIFF:7777] {direction} #{pkt_num} op={opname} len={len(body)} "
+                     f"hex={hex_preview}"
+                     + (f" str={strings}" if strings else ""))
+            else:
+                _dbg(f"[SNIFF:7777] {direction} #{pkt_num} op={opname} len={len(body)}")
+
+            # body уже plaintext — dec_body = body
             self.store.add(direction, body, body, opcode, f"sniff:{opname}", extra=extra)
 
     def run(self):
@@ -1776,11 +1908,13 @@ class WinDivertSniffer:
                         _dbg(f"[SNIFF:7777] SYN {direction} "
                              f"{info['src_ip']}:{info['src_port']}→{info['dst_ip']}:{info['dst_port']}")
                     if is_fin_rst:
-                        # Очистить буферы потока
                         key = self._get_stream_key(info)
                         rev_key = (info["dst_ip"], info["dst_port"], info["src_ip"], info["src_port"])
-                        self._streams.pop(key, None)
-                        self._streams.pop(rev_key, None)
+                        for k in (key, rev_key):
+                            self._streams.pop(k, None)
+                            self._stream_pkt_count.pop(k, None)
+                            self._stream_crypto.pop(k, None)
+                            self._stream_ki_found.pop(k, None)
                     continue
 
                 self._pkt_count += 1
