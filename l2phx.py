@@ -419,6 +419,11 @@ def interpret_packet(direction: str, opcode: int, name: str, dec_hex: str) -> Op
 
     is_inject = "INJECT" in name or "RACE" in name
     prefix = "[INJECT] " if is_inject else ""
+    # C2S opcode table из L2J Mobius НЕ совпадает с live Innova.
+    # game:C2S имена ЛОЖНЫЕ — показываем ТОЛЬКО sniff:/INJECT:/RACE:
+    is_relay_c2s = name.startswith("game:") and direction == "C2S"
+    if is_relay_c2s:
+        return None
 
     # Извлекаем чистое имя без префиксов
     clean = name
@@ -730,11 +735,14 @@ def interpret_packet(direction: str, opcode: int, name: str, dec_hex: str) -> Op
     if is_inject and clean:
         return f"{prefix}{clean}"
 
-    # ─── Catch-all для game: пакетов с осмысленными именами ───
-    # Если имя не числовое (0xNN) и не в blacklist — показываем.
-    # Это ловит ВСЕ named game actions которые не обработаны выше.
-    if name.startswith("game:") and clean and not clean.startswith("0x"):
-        # Blacklist: ambient шум, keepalive, периодические обновления
+    # ─── Catch-all: ТОЛЬКО для sniff/inject (правильные опкоды) ───
+    # C2S opcode table из L2J Mobius НЕ совпадает с live Innova!
+    # game:C2S имена ЛОЖНЫЕ — показываем только через sniff/inject.
+    # S2C из дампа памяти ПРАВИЛЬНАЯ, но через relay всё равно ambient noise.
+    # Catch-all: только sniff: и INJECT: пакеты.
+    if (name.startswith("sniff:") or name.startswith("INJECT:")) \
+       and clean and not clean.startswith("0x"):
+        # S2C blacklist: ambient шум
         _AMBIENT_BLACKLIST = {
             "Logout",  # padding/noise на relay (opcode 0x00)
             "GameGuardReply", "S_GAMEGUARD_QUERY",
@@ -776,6 +784,80 @@ def interpret_packet(direction: str, opcode: int, name: str, dec_hex: str) -> Op
             "RequestBlock", "RequestTutorialPassCmdToS",
             "RequestPrivateStoreManage",
             "RequestHennaRemoveList",
+            # Периодический спам клиента
+            "RequestLinkHtml", "RequestSendFriendMsg",
+            "RequestExFriendDetailInfo", "RequestFriendDetailInfo",
+            "BypassUserCmd", "SendBypassBuildCmd",
+            "RequestShowBoard", "RequestBBSwrite",
+            "RequestAutoSoulShot", "RequestAutoPlay",
+            "RequestTargetCanceld", "RequestTargetActionMenu",
+            "RequestExAutoFish", "RequestPledgePower",
+            "RequestPledgePowerGradeList",
+            "RequestAcquireSkillInfo", "RequestSkillList",
+            "RequestMagicSkillList", "RequestGMList",
+            "RequestPartyMatchConfig", "RequestPartyMatchList",
+            "RequestManorList", "RequestSeedSetting",
+            "RequestProcureCropList", "RequestSetSeed",
+            "RequestSetCrop", "RequestWriteHeroWords",
+            "RequestExOlympiadMatchList",
+            "RequestExMPCCShowPartyMembersInfo",
+            "RequestPledgeMemberInfo",
+            "RequestExBlockDetail", "RequestBlockListDetail",
+            "RequestRecipeBookOpen", "RequestRecipeBookDestroy",
+            "RequestQuestList", "RequestQuestAbort",
+            "RequestTutorialLinkHtml", "RequestTutorialQuestionMark",
+            "RequestTutorialClientEvent",
+            "RequestPetition", "RequestPetitionCancel",
+            "RequestGiveNickName", "RequestChangePetName",
+            "RequestShowMiniMap", "RequestRecordInfo",
+            "RequestSaveBookMarkSlot", "RequestDeleteBookMarkSlot",
+            "RequestModifyBookMarkSlot", "RequestTeleportBookMark",
+            # S2C ambient events не пойманные ранее
+            "S_SPAWN_ITEM", "S_DROP_ITEM",
+            "S_NPC_INFO_ABNORMALVISUA", "S_NPC_INFO_STATE",
+            "S_DOOR_INFO", "S_VEHICLE_INFO", "S_VEHICLE_START_PACKET",
+            "S_SUMMON_INFO", "S_PET_INFO", "S_PET_STATUS_UPDATE",
+            "S_PET_STATUS_SHOW", "S_PET_ITEMLIST", "S_PET_INVENTORY_UPDATE",
+            "S_OBSERVER_START", "S_OBSERVER_END",
+            "S_CASTLE_SIEGE_INFO", "S_CASTLE_SIEGE_ATTACKER_",
+            "S_CASTLE_SIEGE_DEFENDER_",
+            "S_ALLIANCE_INFO", "S_ASK_JOIN_ALLIANCE",
+            "S_ALLIANCE_CREST", "S_PLEDGE_CREST",
+            "S_RECIPE_BOOK_ITEM_LIST",
+            "S_SHOW_BOARD", "S_SHOW_MINIMAP",
+            "S_SHOW_RADAR", "S_DELETE_RADAR",
+            "S_CONFIRM_DLG", "S_SHOW_CALC",
+            "S_L2_FRIEND_LIST", "S_L2_FRIEND", "S_L2_FRIEND_STATUS",
+            "S_CAMERA_MODE", "S_SPECIAL_CAMERA", "S_NORMAL_CAMERA",
+            "S_SKILL_REMAIN_SEC", "S_SET_SUMMON_REMAIN_TIME",
+            "S_EARTHQUAKE", "S_FLY_TO_LOCATION",
+            "S_CLIENT_ACTION", "S_RIDE",
+            "S_DICE", "S_SNOOP",
+            "S_CHAIR_SIT", "S_GM_HIDE",
+            "S_PACKAGE_TO_LIST", "S_PACKAGE_SENDABLE_LIST",
+            "S_MACRO_LIST", "S_SHORTCUT_REG", "S_INIT_SHORTCUT",
+            "S_SHORTCUT_DELETE",
+            "S_PLAY_SOUND", "S_STATIC_OBJECT_INFO",
+            "S_RADAR_CONTROL", "S_MONRACE_INFO",
+            "S_SELL_LIST_PROCURE", "S_BUY_LIST_SEED",
+            "S_BUY_PREVIEW_LIST", "S_BUY_PREVIEW_INFO",
+            "S_SHOW_XMASSEAL", "S_MAX",
+            "S_GM_VIEW_CHARACTER_INFO", "S_GM_VIEW_PLEDGE_INFO",
+            "S_GM_VIEW_SKILL_INFO", "S_GM_VIEW_MAGIC_INFO",
+            "S_GM_VIEW_QUEST_INFO", "S_GM_VIEW_ITEMLIST",
+            "S_GM_VIEW_WAREHOUSE_WITH", "S_GM_HENNA_INFO",
+            "S_SERVER_OBJECT_INFO",
+            "S_PARTY_SMALL_WINDOW_ALL", "S_PARTY_SMALL_WINDOW_ADD",
+            "S_PARTY_SMALL_WINDOW_DEL", "S_PARTY_SPELLED_INFO",
+            "S_LIST_PARTY_WAITING", "S_PARTY_ROOM_INFO",
+            "S_PLEDGE_SHOW_MEMBER_LIS",
+            "S_VEHICLE_DEPARTURE", "S_VEHICLE_CHECK_LOCATION",
+            "S_MOVE_TO_LOCATION_IN_VE", "S_STOP_MOVE_IN_VEHICLE",
+            "S_GETON_VEHICLE", "S_GETOFF_VEHICLE",
+            "S_TUTORIAL_SHOW_HTML", "S_SHOW_TUTORIAL_MARK",
+            "S_TUTORIAL_ENABLE_CLIENT", "S_TUTORIAL_CLOSE_HTML",
+            "S_EX_SUBJOB_INFO", "S_EX_USER_BAN_INFO",
+            "S_EX_BR_SERVER_ID_LIST",
         }
         if clean not in _AMBIENT_BLACKLIST:
             # Формируем человекочитаемое описание
