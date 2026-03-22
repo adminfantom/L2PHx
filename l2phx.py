@@ -45,7 +45,7 @@ from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_DIR = os.path.join(BASE_DIR, "settings")
-ENGINE_PATH = os.path.join(BASE_DIR, "l2_mcp_proxy.py")
+ENGINE_PATH = os.path.join(BASE_DIR, "_engine.py")
 WEB_PORT = 8877
 VERSION = "3.0.0"
 
@@ -264,6 +264,530 @@ class PacketDefDB:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Packet Category Classifier
+# Источник: реконструкция протокола (спецификация операционных плоскостей)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Категории: action (действия игрока), world (фоновый мир), service (UI/lists),
+#             system (сессия/keepalive), unknown
+# Используются для разделения потока в UI на две колонки.
+
+_C2S_ACTION_OPS = {
+    0x00, 0x01,  # Logout, Attack
+    0x19,  # UseItem
+    0x1A, 0x1B, 0x1C, 0x55,  # Trade: start, addItem, done, answer
+    0x1F,  # Action
+    0x23,  # RequestBypassToServer
+    0x30, 0x31, 0x37,  # PrivateStoreListSell, RequestSellItem
+    0x38, 0x39, 0x50,  # RequestMagicSkillUse, skills
+    0x57,  # RequestRestart (confirmed 0x57, NOT 0x46)
+    0x7D,  # RequestRestartPoint
+    0x3B, 0x3C,  # Warehouse deposit/withdraw
+    0x40,  # RequestBuyItem (NPC shop / бакалейная лавка!)
+    0x5F,  # RequestEnchantItem
+    0x6F, 0x70, 0x71, 0x72,  # Henna equip/unequip
+    0x73, 0x7C,  # Skill learn/acquire
+    0x74,  # SendBypassBuildCmd
+    0x83,  # RequestPrivateStoreBuy
+    0x94, 0x95, 0x98,  # PetUseItem, enchant etc
+    0x96, 0x97, 0x99, 0x9A, 0x9C, 0x9D, 0x9F,  # Private store ops
+    0xA7, 0xA8,  # Package/Mail
+    0xB0,  # MultiSellChoose
+    0xC3, 0xC4, 0xC5, 0xC7,  # Henna/BuySeed
+    0xF8,  # ExRequestNewEnchantRemoveTwo
+}
+
+_S2C_ACTION_OPS = {
+    0x06,  # S_SELL_LIST (carrier — но важен для отображения действий)
+    0x07,  # S_BUY_LIST
+    0x14,  # S_TRADE_START
+    0x15, 0x16, 0x17,  # Trade own/other/done
+    0x28,  # S_MAGIC_SKILL_USE
+    0x32,  # S_MAGIC_SKILL_LAUNCHED
+    0x33,  # S_SKILL_LIST
+    0x41, 0x42, 0x43,  # Warehouse deposit/withdraw/done
+    0x5A, 0x5E,  # S_MAGIC_LIST
+    0xA0, 0xA1, 0xA2,  # Private store manage/list/msg
+    0xE4, 0xE5, 0xEE,  # Henna item info/info/equip list
+}
+
+_SYSTEM_OPS_C2S = {0x0E, 0x11, 0x12, 0x2B, 0xCB}  # Proto, Enter, CharSel, Auth, GG
+_SYSTEM_OPS_S2C = {0x09, 0x0A, 0x0B, 0x0E, 0x2E, 0xCB, 0xD9}  # CharSel, Login, KeyInit, GG, Ping
+
+# S2C ambient world (фоновый шум — отдельная категория)
+_S2C_WORLD_OPS = {
+    0x0C,  # S_NPC_INFO
+    0x12,  # S_STATUS_UPDATE
+    0x13,  # S_MOVE_TO_LOCATION
+    0x18,  # S_CHAR_INFO
+    0x19,  # S_USER_INFO
+    0x1D,  # S_TELEPORT_TO_LOCATION
+    0x1E, 0x1F,  # TARGET_SELECTED/UNSELECTED
+    0x20, 0x21,  # AUTO_ATTACK start/stop
+    0x22,  # S_SOCIAL_ACTION
+    0x31,  # S_STOP_MOVE
+    0x39,  # S_VEHICLE_INFO
+    0x4B,  # S_MOVE_TO_PAWN
+    0x4C,  # S_VALIDATE_LOCATION
+    0x4E, 0x4F,  # START/STOP_ROTATING
+    0x52,  # S_SYSTEM_MESSAGE
+    0x65,  # S_ABNORMAL_STATUS_UPDATE
+}
+
+
+def classify_packet(direction: str, opcode: int, name: str = "") -> str:
+    """Classify packet into category for UI split view.
+    Returns: 'action', 'world', 'service', 'system', 'unknown'
+    """
+    # Injected packets are always "action"
+    if "INJECT" in name or "RACE" in name:
+        return "action"
+    # game:* relay inner packets — classify by inner opcode
+    if name.startswith("game:"):
+        name = name[5:]  # strip prefix for classification
+    if direction == "C2S":
+        if opcode in _SYSTEM_OPS_C2S:
+            return "system"
+        if opcode in _C2S_ACTION_OPS:
+            return "action"
+        # Relay outer 0x06 is transport, not action
+        if opcode == 0x06:
+            return "service"
+        return "unknown"
+    else:  # S2C
+        if opcode in _SYSTEM_OPS_S2C:
+            return "system"
+        if opcode in _S2C_ACTION_OPS:
+            return "action"
+        if opcode in _S2C_WORLD_OPS:
+            return "world"
+        return "world"  # default S2C = world background
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Game Event Interpreter — пакеты → человекочитаемый лог
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _read_u32(data: bytes, off: int) -> int:
+    if off + 4 > len(data): return 0
+    return struct.unpack_from("<I", data, off)[0]
+
+def _read_u64(data: bytes, off: int) -> int:
+    if off + 8 > len(data): return 0
+    return struct.unpack_from("<q", data, off)[0]
+
+def _read_u16(data: bytes, off: int) -> int:
+    if off + 2 > len(data): return 0
+    return struct.unpack_from("<H", data, off)[0]
+
+def _read_str16(data: bytes, off: int) -> str:
+    """Read null-terminated UTF-16LE string."""
+    end = off
+    while end + 1 < len(data):
+        if data[end] == 0 and data[end + 1] == 0:
+            break
+        end += 2
+    try:
+        return data[off:end].decode('utf-16-le', errors='replace')
+    except Exception:
+        return "?"
+
+
+def interpret_packet(direction: str, opcode: int, name: str, dec_hex: str) -> Optional[str]:
+    """Interpret a packet into human-readable game event description.
+    Returns None if packet is not interesting enough for game log.
+
+    ВАЖНО:
+    - Работает ТОЛЬКО с game:* и sniff:* пакетами (inner game body).
+    - Outer relay 0x06 и ambient world noise пропускаются.
+    - Field values НЕ парсятся из carrier_plain (могут быть обфусцированы).
+    - Для Ertheia+ опкоды обфусцированы; hardcoded таблица из L2J Mobius
+      может не совпадать с live Innova. Поэтому основная логика работает
+      по имени пакета (name), а не по числовому опкоду.
+    """
+    if not name or not dec_hex:
+        return None
+
+    # ─── Фильтр: только inner game / sniff / inject пакеты ──────
+    # Outer relay контейнеры, ambient transport — не интерпретируем.
+    # Login sequence придёт через sniff:* с порта 7777.
+    if name in ("Relay_0x06", "RequestReplyStopPledgeWar"):
+        return None
+    if not name.startswith("game:") and not name.startswith("sniff:") \
+       and not name.startswith("INJECT:") and not name.startswith("RACE:"):
+        return None
+
+    is_inject = "INJECT" in name or "RACE" in name
+    prefix = "[INJECT] " if is_inject else ""
+
+    # Извлекаем чистое имя без префиксов
+    clean = name
+    for pfx in ("game:", "sniff:", "INJECT:", "RACE:"):
+        if clean.startswith(pfx):
+            clean = clean[len(pfx):]
+
+    try:
+        data = bytes.fromhex(dec_hex) if dec_hex else b""
+    except (ValueError, TypeError):
+        data = b""
+
+    # ─── По ИМЕНИ пакета (надёжнее чем по opcode на Ertheia+) ──
+
+    # Login / Session
+    if clean == "S_VERSION_CHECK" or (opcode == 0x2E and direction == "S2C"):
+        return "Сервер: проверка версии (KEY_INIT)"
+    if clean == "S_LOGIN_RESULT" or (opcode == 0x0A and direction == "S2C"):
+        return "Сервер: результат авторизации"
+    if clean in ("CharSelectionInfo", "S_CHAR_SELECTION_INFO", "S_CHARACTER_SELECTION_INFO"):
+        # Показываем только от sniff (реальный login flow), не от game: relay (шум)
+        if name.startswith("sniff:"):
+            return "Сервер: список персонажей"
+        return None
+    if clean in ("CharSelected", "S_CHAR_SELECTED", "S_CHARACTER_SELECTED"):
+        if name.startswith("sniff:"):
+            return "Сервер: персонаж выбран"
+        return None
+    if clean == "ProtocolVersion":
+        return f"{prefix}Отправлена версия протокола"
+    if clean == "AuthLogin":
+        return f"{prefix}Авторизация"
+    if clean == "CharacterSelect":
+        return f"{prefix}Выбор персонажа"
+    if clean == "EnterWorld":
+        return f"{prefix}Вход в игровой мир"
+    if clean == "Logout":
+        # На relay game:Logout — почти всегда padding/noise (opcode 0x00 = zero byte).
+        # Настоящий Logout показываем только от sniff или inject.
+        if name.startswith("sniff:") or is_inject:
+            return f"{prefix}Выход из игры"
+        return None
+    if clean == "GameGuardReply" or clean == "GameGuardQuery" or clean == "S_GAMEGUARD_QUERY":
+        return None  # спам
+    if clean in ("S_DIE", "S_REVIVE"):
+        # Частые ambient события — не спамить
+        return None
+    # Общий шум S2C: status/move/entity updates (высокочастотные, не показываем)
+    if clean in ("S_STATUS_UPDATE", "S_MOVE_TO_LOCATION", "S_VALIDATE_LOCATION",
+                 "S_NPC_INFO", "S_CHAR_INFO", "S_USER_INFO",
+                 "S_STOP_MOVE", "S_MOVE_TO_PAWN", "S_TARGET_SELECTED",
+                 "S_TARGET_UNSELECTED", "S_COMBAT_MODE_START", "S_COMBAT_MODE_FINISH",
+                 "S_SOCIAL_ACTION", "S_CHANGE_MOVE_TYPE", "S_CHANGE_WAIT_TYPE",
+                 "S_ABNORMAL_STATUS_UPDATE", "S_DELETE_OBJECT",
+                 "S_SUNRISE", "S_SUNSET",
+                 "S_ATTACK_OUT_OF_RANGE", "S_ATTACK_IN_COOLTIME", "S_ATTACK_DEAD_TARGET",
+                 "S_ACTION_FAIL", "S_SERVER_CLOSE", "S_NET_PING",
+                 "S_START_ROTATING", "S_STOP_ROTATING",
+                 "S_SSQ_STATUS", "S_PETITION_VOTE", "S_AGIT_DECO_INFO",
+                 "S_PARTY_MEMBER_POSITION", "S_PARTY_SPELL_INFO"):
+        return None
+
+    # ─── NPC Shop / Торговля ───────────────────────────────────
+    if clean == "RequestBuyItem":
+        return f"{prefix}Покупка у NPC"
+    if clean == "RequestSellItem":
+        return f"{prefix}Продажа NPC"
+    if clean in ("S_BUY_LIST", "BuyList"):
+        return "Сервер: список товаров магазина"
+    if clean in ("S_SELL_LIST", "SellList"):
+        return "Сервер: список для продажи"
+    if clean == "RequestBypassToServer":
+        # Пробуем прочитать bypass команду (надёжно: UTF-16 строка)
+        if data and len(data) >= 3:
+            cmd = _read_str16(data, 1)
+            if cmd and len(cmd) >= 2 and all(0x20 <= ord(c) < 0xFFFE for c in cmd[:10]):
+                short_cmd = cmd[:50] + ("..." if len(cmd) > 50 else "")
+                return f"{prefix}NPC диалог: «{short_cmd}»"
+        return f"{prefix}NPC диалог (bypass)"
+    if clean == "SendBypassBuildCmd":
+        if data and len(data) >= 3:
+            cmd = _read_str16(data, 1)
+            if cmd and len(cmd) >= 2:
+                return f"{prefix}Admin: «{cmd[:40]}»"
+        return f"{prefix}Admin команда"
+
+    # ─── Склад ─────────────────────────────────────────────────
+    if clean == "SendWareHouseDepositList":
+        return f"{prefix}Положить на склад"
+    if clean == "SendWareHouseWithDrawList":
+        return f"{prefix}Забрать со склада"
+    if clean in ("S_WAREHOUSE_DEPOSIT_LIST", "WareHouseDepositList"):
+        return "Сервер: содержимое склада (депозит)"
+    if clean in ("S_WAREHOUSE_WITHDRAW_LIST", "WareHouseWithdrawList"):
+        return "Сервер: содержимое склада (изъятие)"
+    if clean in ("S_WAREHOUSE_DONE", "WareHouseDone"):
+        return "Сервер: операция со складом завершена"
+
+    # ─── Мультиселл ────────────────────────────────────────────
+    if clean == "MultiSellChoose" or clean == "RequestMultiSellChoose":
+        return f"{prefix}Мультиселл: покупка"
+
+    # ─── Обмен ─────────────────────────────────────────────────
+    if clean in ("RequestStartTrade", "TradeRequest"):
+        return f"{prefix}Запрос обмена"
+    if clean == "AddTradeItem":
+        return f"{prefix}Добавление предмета в обмен"
+    if clean == "TradeDone":
+        return f"{prefix}Подтверждение обмена"
+    if clean in ("AnswerTradeRequest", "AnswerTrade"):
+        return f"{prefix}Ответ на запрос обмена"
+    if clean in ("S_TRADE_START", "TradeStart"):
+        return "Сервер: начало обмена"
+    if clean in ("S_TRADE_DONE", "TradeDone") and direction == "S2C":
+        return "Сервер: обмен завершён"
+
+    # ─── Личный магазин ────────────────────────────────────────
+    if clean == "RequestPrivateStoreBuy":
+        return f"{prefix}Покупка в личном магазине"
+    if clean in ("RequestPrivateStoreSell", "SetPrivateStoreListSell"):
+        return f"{prefix}Личный магазин (продажа)"
+    if clean in ("S_PRIVATE_STORE_MANAGE_LIST", "PrivateStoreManageListSell"):
+        return "Сервер: настройка личного магазина"
+    if clean in ("S_PRIVATE_STORE_LIST", "PrivateStoreListSell"):
+        return "Сервер: товары личного магазина"
+
+    # ─── Предметы ──────────────────────────────────────────────
+    if clean == "UseItem":
+        return f"{prefix}Использование предмета"
+    if clean == "RequestEnchantItem":
+        return f"{prefix}Заточка предмета"
+    if clean == "Action":
+        return f"{prefix}Действие с объектом"
+    if clean == "Attack":
+        return f"{prefix}Атака цели"
+
+    # ─── Скиллы ────────────────────────────────────────────────
+    if clean in ("RequestMagicSkillUse", "MagicSkillUse"):
+        return f"{prefix}Использование скилла"
+    if clean in ("S_MAGIC_SKILL_USE", "MagicSkillUse") and direction == "S2C":
+        return "Сервер: применение скилла"
+    if clean == "RequestAcquireSkill":
+        return f"{prefix}Изучение умения"
+    if clean in ("S_SKILL_LIST", "SkillList"):
+        return "Сервер: список умений"
+
+    # ─── Сессия ────────────────────────────────────────────────
+    if clean == "RequestRestart":
+        return f"{prefix}Возврат к выбору персонажа"
+    if clean == "RequestRestartPoint":
+        return f"{prefix}Выбор точки воскрешения"
+
+    # ─── Телепорт ──────────────────────────────────────────────
+    if clean in ("S_TELEPORT_TO_LOCATION", "TeleportToLocation"):
+        return "Телепорт"
+
+    # ─── Чат (S2C Say2) ───────────────────────────────────────
+    if clean in ("S_SAY2", "Say2", "CreatureSay") and direction == "S2C" and data and len(data) >= 10:
+        # Field parse надёжен только для sniff:* (plaintext после XOR).
+        # Для game:* (relay carrier_plain) поля могут быть обфусцированы.
+        is_sniff = name.startswith("sniff:")
+        chat_type = _read_u32(data, 5) if is_sniff else -1
+        chat_names = {0: "Все", 1: "Крик", 2: "Личное", 3: "Группа",
+                      4: "Клан", 8: "Торговля", 15: "Герой", 17: "Осада"}
+        if is_sniff and chat_type in chat_names:
+            chat_label = chat_names[chat_type]
+            try:
+                rest = data[9:]
+                char_name = _read_str16(rest, 0)
+                off2 = len(char_name.encode('utf-16-le')) + 2
+                text = _read_str16(rest, off2) if off2 < len(rest) else ""
+                if char_name and text and len(char_name) < 30:
+                    return f"[Чат:{chat_label}] {char_name}: {text[:80]}"
+            except Exception:
+                pass
+            return f"[Чат:{chat_label}]"
+        return "Чат: сообщение"
+
+    # ─── NPC HTML ──────────────────────────────────────────────
+    if clean in ("S_NPC_HTML_MESSAGE", "NpcHtmlMessage"):
+        return "Сервер: диалог NPC"
+
+    # ─── Почта ─────────────────────────────────────────────────
+    if clean in ("RequestPackageSend", "RequestSendMail"):
+        return f"{prefix}Отправка почты/посылки"
+
+    # ─── Хна ───────────────────────────────────────────────────
+    if clean == "RequestHennaEquip":
+        return f"{prefix}Нанесение хны"
+    if clean == "RequestHennaRemove":
+        return f"{prefix}Снятие хны"
+    if clean in ("RequestHennaItemList", "RequestHennaItemInfo",
+                 "RequestHennaUnEquipList", "RequestHennaUnEquipInfo"):
+        return f"{prefix}Просмотр хны"
+    if "Henna" in clean and direction == "S2C":
+        return None  # ambient S2C carrier — не спамить
+
+    # ─── Предметы (S2C) ─────────────────────────────────────────
+    if clean in ("S_INVENTORY_UPDATE", "InventoryUpdate"):
+        return "Инвентарь обновлён"
+    if clean in ("S_ITEMLIST", "ItemList"):
+        return "Сервер: список предметов"
+
+    # ─── Кристаллизация / Destroy ────────────────────────────────
+    if clean == "RequestCrystallizeItem":
+        return f"{prefix}Кристаллизация предмета"
+    if clean == "RequestDestroyItem":
+        return f"{prefix}Уничтожение предмета"
+
+    # ─── Клан / Альянс ──────────────────────────────────────────
+    if clean in ("RequestJoinPledge", "RequestPledgeInfo"):
+        return f"{prefix}Клан: запрос"
+    if clean in ("RequestJoinAlly", "AllyLeave", "AllyDismiss"):
+        return f"{prefix}Альянс: действие"
+
+    # ─── Группа ─────────────────────────────────────────────────
+    if clean == "RequestJoinParty":
+        return f"{prefix}Приглашение в группу"
+    if clean == "RequestAnswerJoinParty":
+        return f"{prefix}Ответ на приглашение в группу"
+    if clean in ("RequestWithDrawalParty", "RequestOustPartyMember"):
+        return f"{prefix}Выход из группы"
+    if clean in ("S_PARTY_SMALL_WINDOW_ALL", "PartySmallWindowAll"):
+        return "Сервер: состав группы"
+
+    # ─── Рецепты / Крафт ────────────────────────────────────────
+    if clean in ("RequestRecipeItemMakeSelf", "RequestRecipeShopMakeItem"):
+        return f"{prefix}Крафт предмета"
+    if clean in ("RequestRecipeBookOpen", "RequestRecipeShopListSet"):
+        return f"{prefix}Рецептурная книга"
+
+    # ─── Семена / Manor ─────────────────────────────────────────
+    if clean == "RequestBuySeed":
+        return f"{prefix}Покупка семян"
+
+    # ─── S2C FE extended — login sequence ──────────────────────
+    if clean in ("S_EX_QUEUETICKET_LOGIN", "ExQueueTicketLogin"):
+        return "Сервер: очередь входа"
+    if clean in ("S_EX_BR_VERSION", "ExBrVersion"):
+        return "Сервер: версия (BR)"
+    if clean in ("S_EX_QUEUETICKET", "ExQueueTicket"):
+        return "Сервер: позиция в очереди"
+
+    # ─── Действие ──────────────────────────────────────────────
+    if clean == "RequestActionUse":
+        return f"{prefix}Использование действия"
+    if clean == "DlgAnswer":
+        return f"{prefix}Ответ на диалог"
+
+    # ─── Зачарование (расширенные) ──────────────────────────────
+    if "EnchantTargetItem" in clean or "EnchantSupportItem" in clean:
+        return f"{prefix}Заточка: подготовка"
+    if clean == "RequestExCancelEnchantItem":
+        return f"{prefix}Заточка: отмена"
+
+    # ─── Покупка семян (множественная) ──────────────────────────
+    if clean == "RequestRefundItem":
+        return f"{prefix}Возврат предмета"
+
+    # ─── S2C значимые события (из дампа памяти l2_opcodes.json) ─
+    if clean == "S_TELEPORT_TO_LOCATION":
+        return "Телепорт"
+    if clean == "S_GET_ITEM":
+        return "Получен предмет"
+    if clean == "S_DROP_ITEM":
+        return "Предмет выброшен"
+    if clean == "S_SPAWN_ITEM":
+        return "Предмет появился"
+    if clean == "S_BUY_LIST":
+        return "Сервер: список покупки"
+    if clean == "S_MAGIC_SKILL_USE":
+        return "Скилл применён"
+    if clean == "S_MAGIC_SKILL_LAUNCHED":
+        return "Скилл запущен"
+    if clean == "S_ATTACK":
+        return "Атака"
+    if clean == "S_SYSTEM_MESSAGE":
+        return "Системное сообщение"
+    if clean in ("S_TRADE_OWN_ADD", "S_TRADE_OTHER_ADD"):
+        return "Обмен: предмет добавлен"
+    if clean == "S_TRADE_DONE":
+        return "Обмен завершён"
+    if clean == "S_TRADE_START":
+        return "Начало обмена"
+    if clean == "S_WAREHOUSE_DEPOSIT_LIST":
+        return "Сервер: склад (депозит)"
+    if clean == "S_WAREHOUSE_WITHDRAW_LIST":
+        return "Сервер: склад (изъятие)"
+    if clean in ("S_ENCHANT_RESULT", "S_EX_ENCHANT_ONE_OK", "S_EX_ENCHANT_ONE_FAIL"):
+        return "Результат заточки"
+    if clean == "S_ACQUIRE_SKILL_DONE":
+        return "Скилл изучен"
+    if clean == "S_NPC_SAY":
+        return "NPC говорит"
+    if clean in ("S_PARTY_MEMBER_POSITION", "S_PARTY_SPELL_INFO"):
+        return None  # ambient party data
+    if clean in ("S_QUEST_LIST", "S_QUEST_COMPLETED"):
+        return "Квест обновлён"
+    if clean == "S_MULTISELL_LIST":
+        return "Сервер: мультиселл лист"
+    if clean in ("S_PLEDGE_POWER_GRADE_LIST", "S_PLEDGE_SHOW_MEMBER_LIST_ALL"):
+        return "Клан: данные"
+    if clean in ("S_EX_SHOW_SCREEN_MESSAGE", "S_TUTORIAL_SHOW_HTML"):
+        return "Системное уведомление"
+    if clean == "S_RECIPE_SHOP_ITEM_INFO":
+        return "Сервер: крафт рецепт"
+
+    # ─── Fallback: inject всегда показываем ────────────────────
+    if is_inject and clean:
+        return f"{prefix}{clean}"
+
+    # ─── Catch-all для game: пакетов с осмысленными именами ───
+    # Если имя не числовое (0xNN) и не в blacklist — показываем.
+    # Это ловит ВСЕ named game actions которые не обработаны выше.
+    if name.startswith("game:") and clean and not clean.startswith("0x"):
+        # Blacklist: ambient шум, keepalive, периодические обновления
+        _AMBIENT_BLACKLIST = {
+            "Logout",  # padding/noise на relay (opcode 0x00)
+            "GameGuardReply", "S_GAMEGUARD_QUERY",
+            "CannotMoveAnymore", "CannotMoveAnymoreInVehicle",
+            "S_STATUS_UPDATE", "S_MOVE_TO_LOCATION", "S_VALIDATE_LOCATION",
+            "S_NPC_INFO", "S_CHAR_INFO", "S_USER_INFO",
+            "S_STOP_MOVE", "S_MOVE_TO_PAWN", "S_TARGET_SELECTED",
+            "S_TARGET_UNSELECTED", "S_SOCIAL_ACTION",
+            "S_CHANGE_MOVE_TYPE", "S_CHANGE_WAIT_TYPE",
+            "S_ABNORMAL_STATUS_UPDATE", "S_DELETE_OBJECT",
+            "S_SUNRISE", "S_SUNSET",
+            "S_ATTACK_OUT_OF_RANGE", "S_ATTACK_IN_COOLTIME",
+            "S_ATTACK_DEAD_TARGET", "S_ACTION_FAIL",
+            "S_SERVER_CLOSE", "S_NET_PING",
+            "S_START_ROTATING", "S_STOP_ROTATING", "S_FINISH_ROTATING",
+            "S_SSQ_STATUS", "S_PETITION_VOTE", "S_AGIT_DECO_INFO",
+            "S_DIE", "S_REVIVE", "S_COMBAT_MODE_START", "S_COMBAT_MODE_FINISH",
+            "S_ABNORMAL_VISUAL_EFFECT", "S_CLIENT_SETTIME",
+            "S_PARTY_MEMBER_POSITION", "S_PARTY_SMALL_WINDOW_UPDATE",
+            "S_VALIDATE_LOCATION_IN_VEHICLE", "S_VEHICLE_CHECK_LOCATION",
+            "S_EVENT_TRIGGER", "S_RELATION_CHANGED", "S_NICKNAME_CHANGED",
+            "S_PLEDGE_STATUS_CHANGED", "S_PLEDGE_INFO",
+            "S_MY_TARGET_SELECTED", "S_SETUP_GAUGE",
+            "S_HENNA_INFO", "S_HENNA_ITEM_INFO", "S_HENNA_EQUIP_LIST",
+            "S_SKILL_COOL_TIME", "S_ETC_STATUS_UPDATE",
+            "S_SHORT_BUFF_STATUS_UPDATE", "S_DOOR_STATUS_UPDATE",
+            "S_FRIEND_LIST", "S_FRIEND_STATUS", "S_BLOCK_PACKET_LIST",
+            "S_PLEDGE_EXTENDED_INFO", "S_PLEDGE_SHOW_INFO_UPDATE",
+            "RequestPledgeCrest", "RequestAllianceCrest",
+            "RequestPrivateStoreQuitSe", "RequestWithdrawalPledge",
+            "RequestShortCutDel", "RequestShortCutReg",
+            "RequestFriendDel", "RequestFriendList",
+            "RequestSiegeDefenderList", "RequestSiegeAttackerList",
+            "RequestJoinSiege", "RequestConfirmSiegeWaitingList",
+            "RequestSetCastleSiegeTime",
+            "AllyLeave", "AllyDismiss",
+            "RequestDismissAlly",
+            "RequestMoveToLocationInVe",
+            "RequestBlock", "RequestTutorialPassCmdToS",
+            "RequestPrivateStoreManage",
+            "RequestHennaRemoveList",
+        }
+        if clean not in _AMBIENT_BLACKLIST:
+            # Формируем человекочитаемое описание
+            if direction == "C2S":
+                return f"{clean}"
+            else:
+                return f"Сервер: {clean}"
+
+    return None  # не интересно
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # HTML — Современный интерфейс
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -397,6 +921,21 @@ body{background:var(--bg0);color:var(--fg);font:12px var(--font);height:100vh;di
 .log-entry .warn{color:var(--yellow)}
 .log-entry .info{color:var(--cyan)}
 
+/* ─── Game log ─── */
+.gl-entry{padding:2px 0;border-bottom:1px solid rgba(28,35,51,0.3)}
+.gl-ts{color:var(--fg3);font-size:10px;margin-right:6px}
+.gl-c2s{color:var(--accent)}
+.gl-s2c{color:var(--purple)}
+.gl-inject{color:var(--orange);font-weight:600}
+.gl-chat{color:var(--green)}
+.gl-system{color:var(--yellow)}
+.gl-trade{color:var(--cyan)}
+
+/* ─── Category markers (single view) ─── */
+.pkt-table tr.cat-action{border-left:2px solid var(--green)}
+.pkt-table tr.cat-world{border-left:2px solid var(--fg3)}
+.pkt-table tr.cat-system{border-left:2px solid var(--yellow)}
+
 /* ─── Empty state ─── */
 .empty{display:flex;align-items:center;justify-content:center;flex:1;color:var(--fg3);font-size:12px;flex-direction:column;gap:6px}
 .empty .icon{font-size:28px;opacity:0.3}
@@ -421,8 +960,8 @@ body{background:var(--bg0);color:var(--fg);font:12px var(--font);height:100vh;di
 
 <!-- Main -->
 <div class="main">
-  <!-- Left: packet table -->
-  <div class="panel-left">
+  <!-- Left: SPLIT packet tables -->
+  <div class="panel-left" style="display:flex;flex-direction:column">
     <div class="toolbar">
       <input class="tb-input" id="filterInput" type="text" placeholder="&#x1F50D; Filter: name, opcode, hex...">
       <select class="tb-select" id="dirFilter">
@@ -430,27 +969,61 @@ body{background:var(--bg0);color:var(--fg);font:12px var(--font);height:100vh;di
         <option value="C2S">C2S</option>
         <option value="S2C">S2C</option>
       </select>
+      <select class="tb-select" id="catFilter">
+        <option value="all">All Categories</option>
+        <option value="action">Actions Only</option>
+        <option value="world">World Only</option>
+        <option value="system">System Only</option>
+      </select>
+      <select class="tb-select" id="viewMode">
+        <option value="split">Split View</option>
+        <option value="single">Single Stream</option>
+      </select>
       <div class="tb-gap"></div>
       <button class="tb-btn" id="btnAutoScroll" onclick="toggleAuto()">Auto-scroll ON</button>
       <button class="tb-btn" id="btnPause" onclick="togglePause()">Pause</button>
       <button class="tb-btn danger" onclick="clearAll()">Clear</button>
     </div>
-    <div class="pkt-wrap" id="pktWrap">
-      <table class="pkt-table">
-        <thead><tr>
-          <th style="width:40px">#</th>
-          <th style="width:65px">Time</th>
-          <th style="width:36px">Dir</th>
-          <th style="width:64px">Opcode</th>
-          <th style="width:150px">Name</th>
-          <th style="width:44px">Size</th>
-          <th>Data</th>
-        </tr></thead>
-        <tbody id="pktBody"></tbody>
-      </table>
+    <!-- Split view: two columns -->
+    <div id="splitView" style="flex:1;display:flex;overflow:hidden">
+      <!-- Actions column -->
+      <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border)">
+        <div style="background:var(--bg2);padding:4px 8px;font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+          <span>Player Actions</span><span id="cntActions" style="color:var(--fg2)">0</span>
+        </div>
+        <div class="pkt-wrap" id="pktWrapActions">
+          <table class="pkt-table"><thead><tr>
+            <th style="width:32px">#</th><th style="width:55px">Time</th><th style="width:30px">Dir</th>
+            <th style="width:54px">Op</th><th style="width:140px">Name</th><th style="width:36px">Sz</th><th>Data</th>
+          </tr></thead><tbody id="pktBodyActions"></tbody></table>
+        </div>
+      </div>
+      <!-- World column -->
+      <div style="flex:1;display:flex;flex-direction:column">
+        <div style="background:var(--bg2);padding:4px 8px;font-size:10px;font-weight:700;color:var(--purple);text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+          <span>World / System</span><span id="cntWorld" style="color:var(--fg2)">0</span>
+        </div>
+        <div class="pkt-wrap" id="pktWrapWorld">
+          <table class="pkt-table"><thead><tr>
+            <th style="width:32px">#</th><th style="width:55px">Time</th><th style="width:30px">Dir</th>
+            <th style="width:54px">Op</th><th style="width:140px">Name</th><th style="width:36px">Sz</th><th>Data</th>
+          </tr></thead><tbody id="pktBodyWorld"></tbody></table>
+        </div>
+      </div>
+    </div>
+    <!-- Single view (hidden by default) -->
+    <div id="singleView" style="flex:1;overflow:hidden;display:none">
+      <div class="pkt-wrap" id="pktWrap">
+        <table class="pkt-table"><thead><tr>
+          <th style="width:40px">#</th><th style="width:65px">Time</th><th style="width:36px">Dir</th>
+          <th style="width:64px">Opcode</th><th style="width:150px">Name</th><th style="width:44px">Size</th><th>Data</th>
+        </tr></thead><tbody id="pktBody"></tbody></table>
+      </div>
     </div>
     <div class="statusbar">
-      <span>Shown: <b id="statShown">0</b></span>
+      <span>Actions: <b id="statActions">0</b></span>
+      <span>World: <b id="statWorld">0</b></span>
+      <span>Total: <b id="statShown">0</b></span>
       <span>BF: <b id="statBF">--</b></span>
       <span>XOR: <b id="statXOR">--</b></span>
       <span>Target: <b id="statTarget">--</b></span>
@@ -461,6 +1034,7 @@ body{background:var(--bg0);color:var(--fg);font:12px var(--font);height:100vh;di
   <div class="panel-right">
     <div class="tabs">
       <div class="tab active" data-tab="details" onclick="switchTab('details',this)">Details</div>
+      <div class="tab" data-tab="gamelog" onclick="switchTab('gamelog',this)">Game Log</div>
       <div class="tab" data-tab="inject" onclick="switchTab('inject',this)">Inject</div>
       <div class="tab" data-tab="log" onclick="switchTab('log',this)">Log</div>
     </div>
@@ -473,6 +1047,13 @@ body{background:var(--bg0);color:var(--fg);font:12px var(--font);height:100vh;di
           <div class="empty"><div class="icon">&#9776;</div>Click a packet row to inspect</div>
         </div>
         <div class="hex-view" id="hexView"></div>
+      </div>
+
+      <!-- Game Log -->
+      <div class="tab-pane" id="pane-gamelog" style="overflow-y:auto;padding:0">
+        <div id="gameLogArea" style="padding:4px 8px;font-size:12px;line-height:1.8">
+          <div class="empty"><div class="icon">&#127918;</div>Game events will appear here</div>
+        </div>
       </div>
 
       <!-- Inject -->
@@ -516,6 +1097,7 @@ body{background:var(--bg0);color:var(--fg);font:12px var(--font);height:100vh;di
 const WS = location.protocol==='https:'?'wss://':'ws://';
 let ws, packets=[], autoScroll=true, paused=false, selSeq=-1;
 let cC2S=0, cS2C=0, rate=0, rateT=0;
+let nActions=0, nWorld=0;
 
 function conn(){
   ws=new WebSocket(WS+location.host+'/ws');
@@ -524,6 +1106,7 @@ function conn(){
   ws.onmessage=e=>{
     const m=JSON.parse(e.data);
     if(m.type==='packet') onPacket(m.data);
+    else if(m.type==='gamelog') onGameLog(m.data);
     else if(m.type==='status') onStatus(m.data);
     else if(m.type==='crypto') onCrypto(m.data);
     else if(m.type==='parsed') onParsed(m.data);
@@ -547,21 +1130,47 @@ function onPacket(p){
 function matchFilter(p){
   const d=$('dirFilter').value;
   if(d!=='all'&&p.dir!==d) return false;
+  const cf=$('catFilter').value;
+  if(cf!=='all'&&(p.category||'unknown')!==cf) return false;
   const t=$('filterInput').value.toLowerCase();
   if(!t) return true;
   return (p.name||'').toLowerCase().includes(t)||(p.opcode_hex||'').toLowerCase().includes(t)||(p.preview||'').toLowerCase().includes(t);
 }
 
+function isActionPkt(p){
+  const c=p.category||'unknown';
+  return c==='action'||c==='service'||p.injected;
+}
+
 function addRow(p){
-  const tb=$('pktBody'),tr=document.createElement('tr');
-  tr.className=(p.injected?'injected ':'')+(selSeq===p.seq?'sel':'');
-  tr.dataset.seq=p.seq;
-  tr.onclick=()=>selectPkt(p);
+  const isSplit=$('viewMode').value==='split';
   const dc=p.dir==='C2S'?'dir-c2s':'dir-s2c';
-  tr.innerHTML=`<td>${p.seq}</td><td>${p.time||''}</td><td class="${dc}">${p.dir}</td><td>${p.opcode_hex||''}</td><td class="pkt-name" title="${p.name||''}">${p.name||'?'}</td><td>${p.size||0}</td><td style="color:var(--fg3)" title="${p.preview||''}">${(p.preview||'').substring(0,50)}</td>`;
-  tb.appendChild(tr);
-  $('statShown').textContent=tb.children.length;
-  if(autoScroll) $('pktWrap').scrollTop=$('pktWrap').scrollHeight;
+  const html=`<td>${p.seq}</td><td>${p.time||''}</td><td class="${dc}">${p.dir}</td><td>${p.opcode_hex||''}</td><td class="pkt-name" title="${p.name||''}">${p.name||'?'}</td><td>${p.size||0}</td><td style="color:var(--fg3)" title="${p.preview||''}">${(p.preview||'').substring(0,50)}</td>`;
+
+  if(isSplit){
+    const isAct=isActionPkt(p);
+    const tb=isAct?$('pktBodyActions'):$('pktBodyWorld');
+    const wr=isAct?$('pktWrapActions'):$('pktWrapWorld');
+    const tr=document.createElement('tr');
+    tr.className=(p.injected?'injected ':'')+(selSeq===p.seq?'sel':'');
+    tr.dataset.seq=p.seq;
+    tr.onclick=()=>selectPkt(p);
+    tr.innerHTML=html;
+    tb.appendChild(tr);
+    if(isAct){nActions++;$('cntActions').textContent=nActions;$('statActions').textContent=nActions;}
+    else{nWorld++;$('cntWorld').textContent=nWorld;$('statWorld').textContent=nWorld;}
+    if(autoScroll) wr.scrollTop=wr.scrollHeight;
+  } else {
+    const tb=$('pktBody'),tr=document.createElement('tr');
+    const catClass=p.category==='action'?' cat-action':p.category==='world'?' cat-world':p.category==='system'?' cat-system':'';
+    tr.className=(p.injected?'injected ':'')+(selSeq===p.seq?'sel':'')+catClass;
+    tr.dataset.seq=p.seq;
+    tr.onclick=()=>selectPkt(p);
+    tr.innerHTML=html;
+    tb.appendChild(tr);
+    if(autoScroll) $('pktWrap').scrollTop=$('pktWrap').scrollHeight;
+  }
+  $('statShown').textContent=packets.filter(matchFilter).length;
 }
 
 function selectPkt(p){
@@ -603,7 +1212,9 @@ function onStatus(s){
   else if(s.running){led.className='led led-wait';txt.textContent='Proxy: listening';}
   else{led.className='led led-off';txt.textContent='Proxy: off';}
   if(s.target)$('statTarget').textContent=s.target;
-  if(s.divert){$('ledDivert').className='led led-on';$('txtDivert').textContent='WinDivert: active';}
+  if(s.divert){$('ledDivert').className='led led-on';$('txtDivert').textContent='WinDivert: active'+(s.sniffer?' + Sniff 7777':'');}
+  else if(s.sniffer){$('ledDivert').className='led led-on';$('txtDivert').textContent='Sniffer 7777: active';}
+  else{$('ledDivert').className='led led-off';$('txtDivert').textContent='WinDivert: off';}
 }
 function onCrypto(c){
   const led=$('ledCrypto'),txt=$('txtCrypto');
@@ -614,10 +1225,28 @@ function onCrypto(c){
 }
 function onInjectResult(r){if(r.error)addLog('Inject error: '+r.error,'err');else addLog('Injected: '+JSON.stringify(r),'ok');}
 
+// Game Log
+function onGameLog(d){
+  const a=$('gameLogArea');
+  if(a.querySelector('.empty'))a.innerHTML='';
+  const div=document.createElement('div');
+  div.className='gl-entry';
+  let cls='gl-c2s';
+  if(d.dir==='S2C') cls='gl-s2c';
+  if(d.text.includes('INJECT')) cls='gl-inject';
+  if(d.text.includes('[Чат:')) cls='gl-chat';
+  if(d.text.includes('Системное') || d.text.includes('Сервер:')) cls='gl-system';
+  if(d.text.includes('обмен') || d.text.includes('магазин') || d.text.includes('Покупка') || d.text.includes('Продажа') || d.text.includes('склад')) cls='gl-trade';
+  div.innerHTML=`<span class="gl-ts">${d.time||''}</span><span class="${cls}">${d.text}</span>`;
+  a.appendChild(div);
+  if(a.children.length>500)a.removeChild(a.firstChild);
+  a.scrollTop=a.scrollHeight;
+}
+
 // Controls
 function toggleAuto(){autoScroll=!autoScroll;const b=$('btnAutoScroll');b.textContent='Auto-scroll '+(autoScroll?'ON':'OFF');b.classList.toggle('active',autoScroll);}
 function togglePause(){paused=!paused;const b=$('btnPause');b.textContent=paused?'Resume':'Pause';b.classList.toggle('active',paused);}
-function clearAll(){packets=[];cC2S=cS2C=0;$('pktBody').innerHTML='';$('cntC2S').textContent='0';$('cntS2C').textContent='0';$('cntTotal').textContent='0';$('statShown').textContent='0';}
+function clearAll(){packets=[];cC2S=cS2C=nActions=nWorld=0;$('pktBody').innerHTML='';$('pktBodyActions').innerHTML='';$('pktBodyWorld').innerHTML='';$('cntC2S').textContent='0';$('cntS2C').textContent='0';$('cntTotal').textContent='0';$('cntActions').textContent='0';$('cntWorld').textContent='0';$('statShown').textContent='0';$('statActions').textContent='0';$('statWorld').textContent='0';}
 
 // Tabs
 function switchTab(id,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));$('pane-'+id).classList.add('active');}
@@ -662,10 +1291,17 @@ function addLog(text,level){
   a.appendChild(d);a.scrollTop=a.scrollHeight;
 }
 
-// Filter
+// Filter & view mode
 $('filterInput').addEventListener('input',rebuild);
 $('dirFilter').addEventListener('change',rebuild);
-function rebuild(){$('pktBody').innerHTML='';packets.filter(matchFilter).forEach(addRow);}
+$('catFilter').addEventListener('change',rebuild);
+$('viewMode').addEventListener('change',function(){
+  const s=$('viewMode').value==='split';
+  $('splitView').style.display=s?'flex':'none';
+  $('singleView').style.display=s?'none':'';
+  rebuild();
+});
+function rebuild(){$('pktBody').innerHTML='';$('pktBodyActions').innerHTML='';$('pktBodyWorld').innerHTML='';nActions=nWorld=0;packets.filter(matchFilter).forEach(addRow);}
 
 // Rate
 setInterval(()=>{$('txtRate').textContent=rate+' pkt/s';rate=0;},1000);
@@ -702,6 +1338,8 @@ class WebServer:
         self.ws_clients: set = set()
         self._last_seq = 0
         self._log_buffer: deque = deque(maxlen=200)
+        self.divert = None   # WinDivertRedirector reference (set from main)
+        self.sniffer = None  # WinDivertSniffer reference (set from main)
 
     def log(self, text, level="info"):
         self._log_buffer.append({"text": text, "level": level})
@@ -715,13 +1353,13 @@ class WebServer:
         from aiohttp import web
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        self.ws_clients.add(ws)
-        self.log(f"WS client connected ({len(self.ws_clients)})")
+        self.log(f"WS client connecting...")
 
-        # Отправить начальный статус
+        # Отправить начальный статус ДО добавления в clients
         await self._send_status(ws)
 
-        # Отправить историю пакетов (последние 300) и обновить _last_seq
+        # Отправить историю и обновить _last_seq ДО добавления в broadcast list
+        # (иначе broadcast loop может отправить дубли)
         recent = self.store.get_recent(300)
         for pkt in recent:
             try:
@@ -734,10 +1372,12 @@ class WebServer:
                 size = pkt.get("len", 0)
                 ts = pkt.get("ts", "")
                 preview = dec_hex[:80] + ("..." if len(dec_hex) > 80 else "") if dec_hex else ""
+                direction = pkt.get("dir", "C2S")
+                category = classify_packet(direction, opcode_int, name)
                 msg = {"type": "packet", "data": {
                     "seq": seq,
                     "time": ts,
-                    "dir": pkt.get("dir", "C2S"),
+                    "dir": direction,
                     "opcode_hex": opcode_hex,
                     "name": name,
                     "size": size,
@@ -745,11 +1385,14 @@ class WebServer:
                     "raw_hex": pkt.get("raw_hex", ""),
                     "preview": preview,
                     "injected": "INJECT" in (name or ""),
+                    "category": category,
                 }}
                 await ws.send_json(msg)
             except Exception:
                 break
-        self.log(f"Sent {len(recent)} history packets to new client")
+        # Теперь добавляем в broadcast list — все последующие пакеты пойдут через broadcast loop
+        self.ws_clients.add(ws)
+        self.log(f"WS client connected ({len(self.ws_clients)}), sent {len(recent)} history packets")
 
         try:
             async for msg in ws:
@@ -766,12 +1409,23 @@ class WebServer:
         return ws
 
     async def _send_status(self, ws):
-        status = {"running": False, "connected": False, "target": "", "divert": False}
+        status = {"running": False, "connected": False, "target": "", "divert": False, "sniffer": False}
         if self.proxy:
             status["running"] = self.proxy.running
             status["connected"] = getattr(self.proxy, 'connected', False)
             t = self.proxy._get_target() if hasattr(self.proxy, '_get_target') else ("", 0)
             status["target"] = f"{t[0]}:{t[1]}"
+        # WinDivert: проверяем наличие объекта И его running-атрибут
+        divert_obj = self.divert
+        sniffer_obj = self.sniffer
+        if divert_obj is not None:
+            status["divert"] = bool(getattr(divert_obj, 'running', False))
+        if sniffer_obj is not None:
+            status["sniffer"] = bool(getattr(sniffer_obj, 'running', False))
+        self.log(f"[status] proxy.running={status['running']} connected={status['connected']} "
+                 f"divert={status['divert']} sniffer={status['sniffer']} "
+                 f"divert_obj={divert_obj is not None} sniffer_obj={sniffer_obj is not None}",
+                 "debug")
         await ws.send_json({"type": "status", "data": status})
 
         crypto_data = {"initialized": False}
@@ -790,7 +1444,28 @@ class WebServer:
             hex_data = data.get("hex", "")
             direction = data.get("dir", "C2S")
             if hex_data:
-                parsed = self.pkt_db.parse_packet(bytes.fromhex(hex_data), direction)
+                raw = bytes.fromhex(hex_data)
+                parsed = self.pkt_db.parse_packet(raw, direction)
+                # Fallback: если INI не дал полей, используем hardcoded parsers
+                if (not parsed.get("fields") or len(parsed.get("fields", [])) == 0) \
+                        and direction == "C2S" and raw:
+                    from _engine import _parse_known_c2s
+                    known = _parse_known_c2s(raw[0], raw)
+                    if known:
+                        # Определяем источник: sniff (чистый) vs game (carrier_plain)
+                        pkt_name = data.get("name", "") if isinstance(data, dict) else ""
+                        is_sniff = "sniff:" in str(pkt_name) or "INJECT:" in str(pkt_name)
+                        parsed["fields"] = [
+                            {"name": k, "type": "d" if isinstance(v, int) else
+                             "list" if isinstance(v, list) else "?",
+                             "value": v,
+                             "display": str(v)}
+                            for k, v in known.items()
+                        ]
+                        if is_sniff:
+                            parsed["note"] = "Clean values (sniff/inject)"
+                        else:
+                            parsed["note"] = "Field values from relay carrier_plain (may be obfuscated)"
                 await ws.send_json({"type": "parsed", "data": parsed})
         elif action.startswith("inject") or action == "flood":
             result = self._handle_inject(action, data)
@@ -860,8 +1535,7 @@ class WebServer:
                 if not self.ws_clients:
                     continue
 
-                recent = self.store.get_recent(300)
-                new_pkts = [p for p in recent if p.get("seq", 0) > self._last_seq]
+                new_pkts = self.store.get_since_seq(self._last_seq, max_count=500)
 
                 if new_pkts and _heartbeat % 25 == 0:
                     self.log(f"[broadcast] sending {len(new_pkts)} new packets", "debug")
@@ -877,6 +1551,7 @@ class WebServer:
                     ts = pkt.get("ts", "") or pkt.get("time", "")
                     preview = dec_hex[:80] + ("..." if len(dec_hex) > 80 else "") if dec_hex else ""
 
+                    category = classify_packet(direction, opcode_int, name)
                     msg = {"type": "packet", "data": {
                         "seq": pkt.get("seq", 0),
                         "time": ts,
@@ -888,8 +1563,17 @@ class WebServer:
                         "raw_hex": pkt.get("raw_hex", ""),
                         "preview": preview,
                         "injected": "INJECT" in (name or ""),
+                        "category": category,
                     }}
                     await self._broadcast(msg)
+
+                    # Game log — интерпретация пакета в человекочитаемый текст
+                    gl_text = interpret_packet(direction, opcode_int, name, dec_hex)
+                    if gl_text:
+                        await self._broadcast({"type": "gamelog", "data": {
+                            "time": ts, "dir": direction, "text": gl_text,
+                            "opcode": opcode_hex, "seq": pkt.get("seq", 0),
+                        }})
 
             except Exception as e:
                 self.log(f"[broadcast] ERROR: {e}", "err")
@@ -898,12 +1582,16 @@ class WebServer:
                 await asyncio.sleep(1)
 
     async def _broadcast_status_all(self):
-        status = {"running": False, "connected": False, "target": "", "divert": False}
+        status = {"running": False, "connected": False, "target": "", "divert": False, "sniffer": False}
         if self.proxy:
             status["running"] = self.proxy.running
             status["connected"] = getattr(self.proxy, 'connected', False)
             t = self.proxy._get_target() if hasattr(self.proxy, '_get_target') else ("", 0)
             status["target"] = f"{t[0]}:{t[1]}"
+        if self.divert and getattr(self.divert, 'running', False):
+            status["divert"] = True
+        if self.sniffer and getattr(self.sniffer, 'running', False):
+            status["sniffer"] = True
 
         crypto_data = {"initialized": False}
         if self.proxy and hasattr(self.proxy, 'crypto') and self.proxy.crypto:
@@ -955,6 +1643,7 @@ class WebServer:
                 c = self.proxy.crypto
                 crypto_data = {
                     "initialized": c.initialized,
+                    "passthrough": c.passthrough,
                     "bf_key": c.bf_key.hex() if c.bf_key else None,
                     "xor_key": c.xor_key.hex() if c.xor_key else None,
                     "running": self.proxy.running,
@@ -975,6 +1664,186 @@ class WebServer:
                        "inject_s2c", "flood"):
             result = self._handle_inject(action, data)
             return web.json_response(result)
+
+        # ═══ WAREHOUSE RACE HOOK API ═══
+        if action == "race_hook":
+            from _engine import _RACE_HOOK
+            if "enabled" in data:
+                _RACE_HOOK["enabled"] = bool(data["enabled"])
+            if "count" in data:
+                _RACE_HOOK["count"] = int(data["count"])
+            if "opcode" in data:
+                _RACE_HOOK["opcode"] = int(data["opcode"], 16) if isinstance(data["opcode"], str) else int(data["opcode"])
+            if data.get("reset"):
+                _RACE_HOOK["fired"] = False
+                _RACE_HOOK["log"] = []
+            return web.json_response({
+                "enabled": _RACE_HOOK["enabled"],
+                "opcode": f"0x{_RACE_HOOK['opcode']:02X}",
+                "count": _RACE_HOOK["count"],
+                "fired": _RACE_HOOK["fired"],
+                "log": _RACE_HOOK["log"],
+            })
+
+        # ═══ MULTISELL CAPTURE + REPLAY API ═══
+        if action == "multisell_cap":
+            from _engine import _MULTISELL_CAP, multisell_replay_modify, wrap_relay_0x06
+            import struct as _struct
+
+            sub = data.get("sub", "status")
+
+            if sub == "status":
+                return web.json_response({
+                    "enabled": _MULTISELL_CAP["enabled"],
+                    "count": len(_MULTISELL_CAP["captured"]),
+                    "captured": _MULTISELL_CAP["captured"][-5:],
+                })
+
+            if sub == "clear":
+                _MULTISELL_CAP["captured"] = []
+                return web.json_response({"ok": True})
+
+            if sub == "replay":
+                # Replay last captured packet (exact copy or modified)
+                caps = _MULTISELL_CAP["captured"]
+                if not caps:
+                    return web.json_response({"error": "No captured MultiSellChoose packets"}, status=400)
+
+                idx = int(data.get("idx", -1))
+                cap = caps[idx]
+                game_hex = cap["game_hex"]
+
+                new_entry = data.get("entry_id")
+                old_entry = data.get("old_entry_id")
+                new_amount = data.get("amount")
+                old_amount = data.get("old_amount")
+                count = int(data.get("count", 1))
+
+                if new_entry is not None or new_amount is not None:
+                    game_body = multisell_replay_modify(
+                        game_hex,
+                        new_entry_id=int(new_entry) if new_entry is not None else None,
+                        old_entry_id=int(old_entry) if old_entry is not None else None,
+                        new_amount=int(new_amount) if new_amount is not None else None,
+                        old_amount=int(old_amount) if old_amount is not None else None,
+                    )
+                else:
+                    game_body = bytes.fromhex(game_hex)
+
+                # Wrap and inject
+                wrapped = wrap_relay_0x06(game_body)
+                pkt_len = len(wrapped) + 2
+                single_l2 = _struct.pack("<H", pkt_len) + wrapped
+                burst = single_l2 * count
+
+                if self.proxy and hasattr(self.proxy, 'server_sock') and self.proxy.server_sock:
+                    import threading
+                    lock = getattr(self.proxy, 'relay_server_lock', threading.Lock())
+                    with lock:
+                        self.proxy.server_sock.sendall(burst)
+                    return web.json_response({
+                        "ok": True,
+                        "copies": count,
+                        "game_len": len(game_body),
+                        "modified": new_entry is not None or new_amount is not None,
+                        "game_hex": game_body.hex()[:64],
+                    })
+                else:
+                    # Нет активного соединения — inject_c2s в PLAINTEXT_INTERMEDIATE
+                    # режиме НЕ работает (relay оборачивает в 0x06, сервер XOR-декодирует
+                    # мусор). Сообщаем об ошибке — нельзя слать без server_sock.
+                    return web.json_response({
+                        "error": "not_connected",
+                        "msg": "server_sock is None — нет активной relay-сессии. Дождитесь подключения игрока.",
+                    }, status=503)
+
+            return web.json_response({"error": f"Unknown sub: {sub}"}, status=400)
+
+        # ═══ UNIVERSAL GAME BODY CAPTURE API ═══
+        if action == "game_cap":
+            from _engine import _GAME_CAP, wrap_relay_0x06
+            import struct as _struct
+
+            sub = data.get("sub", "status")
+
+            if sub == "status":
+                caps = _GAME_CAP["captured"]
+                # Filter by min_len, first_byte, time range
+                min_len = int(data.get("min_len", 0))
+                max_len = int(data.get("max_len", 99999))
+                first_byte = data.get("first_byte")  # hex string like "b0"
+                since = data.get("since")  # timestamp like "00:05:00"
+                limit = int(data.get("limit", 50))
+
+                filtered = []
+                for c in caps:
+                    if c["game_len"] < min_len or c["game_len"] > max_len:
+                        continue
+                    if first_byte is not None and c["first_byte"] != int(first_byte, 16):
+                        continue
+                    if since and c["ts"] < since:
+                        continue
+                    filtered.append(c)
+
+                return web.json_response({
+                    "total_captured": len(caps),
+                    "total_unique_seen": len(_GAME_CAP["_seen_hashes"]),
+                    "filtered": len(filtered),
+                    "packets": filtered[-limit:],
+                })
+
+            if sub == "clear":
+                _GAME_CAP["captured"] = []
+                _GAME_CAP["_seen_hashes"] = set()
+                return web.json_response({"ok": True})
+
+            if sub == "replay":
+                # Replay specific captured game_body by index or game_hex
+                caps = _GAME_CAP["captured"]
+                idx = data.get("idx")
+                game_hex = data.get("game_hex")
+                count = int(data.get("count", 1))
+
+                if game_hex:
+                    game_body = bytes.fromhex(game_hex)
+                elif idx is not None:
+                    game_body = bytes.fromhex(caps[int(idx)]["game_hex"])
+                else:
+                    return web.json_response({"error": "Need idx or game_hex"}, status=400)
+
+                # Optional XOR field modification
+                mods = data.get("xor_mods")  # list of {offset, old_hex, new_hex}
+                if mods:
+                    game_body = bytearray(game_body)
+                    for m in mods:
+                        off = int(m["offset"])
+                        old_b = bytes.fromhex(m["old_hex"])
+                        new_b = bytes.fromhex(m["new_hex"])
+                        for i in range(min(len(old_b), len(new_b))):
+                            if off + i < len(game_body):
+                                game_body[off + i] ^= old_b[i] ^ new_b[i]
+                    game_body = bytes(game_body)
+
+                wrapped = wrap_relay_0x06(game_body)
+                pkt_len = len(wrapped) + 2
+                single_l2 = _struct.pack("<H", pkt_len) + wrapped
+                burst = single_l2 * count
+
+                if self.proxy and hasattr(self.proxy, 'server_sock') and self.proxy.server_sock:
+                    import threading
+                    lock = getattr(self.proxy, 'relay_server_lock', threading.Lock())
+                    with lock:
+                        self.proxy.server_sock.sendall(burst)
+                    return web.json_response({
+                        "ok": True,
+                        "copies": count,
+                        "game_len": len(game_body),
+                        "game_hex": game_body.hex()[:80],
+                    })
+                else:
+                    return web.json_response({"error": "No server socket"}, status=500)
+
+            return web.json_response({"error": f"Unknown sub: {sub}"}, status=400)
 
         return web.json_response({"error": f"Unknown action: {action}"}, status=400)
 
@@ -1068,11 +1937,13 @@ def main():
     threading.Thread(target=proxy.run, daemon=True, name="proxy").start()
 
     # 4. WinDivert
+    divert = None
+    sniffer = None
     if args.divert:
         divert = engine.WinDivertRedirector(engine.PROXY_PORT)
         threading.Thread(target=divert.run, daemon=True, name="divert").start()
         # Пассивный сниффер порта 7777 (без перехвата)
-        sniffer = engine.WinDivertSniffer(store)
+        sniffer = engine.WinDivertSniffer(store, proxy=proxy)
         threading.Thread(target=sniffer.run, daemon=True, name="sniff-7777").start()
     else:
         print("[DIVERT] Off (use --divert)", file=sys.stderr)
@@ -1094,10 +1965,29 @@ def main():
     if not args.no_browser:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
-    # 7. Web GUI (async main loop)
+    # 7. Web GUI — запуск в отдельном потоке с авто-перезапуском.
+    # Если WebServer упадёт → перезапустится. WinDivert и relay-proxy НЕ трогаются.
     server = WebServer(pkt_db, proxy, store, args.port)
+    server.divert = divert
+    server.sniffer = sniffer
+
+    def _run_webserver():
+        while True:
+            try:
+                asyncio.run(server.start())
+            except KeyboardInterrupt:
+                return
+            except Exception as e:
+                print(f"[WEBSERVER] Crashed: {e}, restart in 3s...", file=sys.stderr)
+                time.sleep(3)
+
+    t_web = threading.Thread(target=_run_webserver, daemon=True, name="webserver")
+    t_web.start()
+
+    # Основной поток держит процесс живым (daemon-треды умирают вместе с ним)
     try:
-        asyncio.run(server.start())
+        while True:
+            time.sleep(60)
     except KeyboardInterrupt:
         print("\n[EXIT] Bye", file=sys.stderr)
 
