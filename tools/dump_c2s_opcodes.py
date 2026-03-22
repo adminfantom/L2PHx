@@ -251,29 +251,59 @@ def main():
         print("ERROR: L2.exe not found")
         sys.exit(1)
     print(f"L2.exe PID: {pid}")
+    print(f"Python: {sys.version} ({'64-bit' if struct.calcsize('P')==8 else '32-bit'})")
 
-    enable_debug_priv()
+    dp = enable_debug_priv()
+    print(f"SeDebugPrivilege: {'OK' if dp else 'FAILED (run as admin!)'}")
 
-    handle = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
+    # Try multiple access flag combinations
+    for flags_name, flags in [
+        ("VM_READ|QUERY_INFO", PROCESS_VM_READ | PROCESS_QUERY_INFORMATION),
+        ("ALL_ACCESS", 0x001F0FFF),
+        ("VM_READ only", PROCESS_VM_READ),
+    ]:
+        handle = kernel32.OpenProcess(flags, False, pid)
+        if handle:
+            print(f"OpenProcess({flags_name}): OK handle=0x{handle:X}")
+            break
+        else:
+            err = ctypes.get_last_error()
+            print(f"OpenProcess({flags_name}): FAILED error={err}")
+
     if not handle:
-        print(f"ERROR: OpenProcess failed: {ctypes.get_last_error()}")
+        print("ERROR: Cannot open L2.exe process. Run as Administrator!")
         sys.exit(1)
 
-    # Find modules (pass handle for known-base fallback)
-    _rpm_handle_for_find = handle  # used by Method 3
+    # Diagnostic: try to read L2.exe main module (0x00400000 typical for 32-bit)
+    for test_addr in [0x00400000, 0x10000000, 0x15000000, 0x20000000]:
+        test = rpm(handle, test_addr, 4)
+        if test:
+            print(f"  RPM 0x{test_addr:08X}: OK [{test[:4].hex()}]" +
+                  (" (MZ!)" if test[:2] == b'MZ' else ""))
+        else:
+            err = ctypes.get_last_error()
+            print(f"  RPM 0x{test_addr:08X}: FAILED error={err}")
 
+    # Find modules — method 1: Toolhelp
+    print("\n--- Module search ---")
     modules = {}
     for mod_name in ["Core.dll", "NWindow.dll", "Engine.dll"]:
+        print(f"Looking for {mod_name}...")
         base, size = find_module(pid, mod_name)
-        # Method 3 fallback: try known base with our handle
-        if not base:
+        if base:
+            print(f"  Toolhelp/EnumModules: base=0x{base:08X} size=0x{size:08X}")
+        else:
+            print(f"  Toolhelp/EnumModules: NOT FOUND")
+            # Method 3 fallback
             known = {"core.dll": 0x15000000, "nwindow.dll": 0x10000000, "engine.dll": 0x20000000}
             kb = known.get(mod_name.lower())
             if kb:
                 test = rpm(handle, kb, 2)
                 if test and test[:2] == b'MZ':
                     base, size = kb, 0x2000000
-                    print(f"  {mod_name}: fallback to known base 0x{kb:08X}")
+                    print(f"  Known base fallback: 0x{kb:08X} (MZ verified)")
+                else:
+                    print(f"  Known base 0x{kb:08X}: {'read failed' if not test else 'no MZ header'}")
         if base:
             modules[mod_name] = {"base": base, "size": size}
             print(f"{mod_name}: base=0x{base:08X} size=0x{size:08X}")
