@@ -419,11 +419,29 @@ def interpret_packet(direction: str, opcode: int, name: str, dec_hex: str) -> Op
 
     is_inject = "INJECT" in name or "RACE" in name
     prefix = "[INJECT] " if is_inject else ""
-    # C2S opcode table из L2J Mobius НЕ совпадает с live Innova.
-    # game:C2S имена ЛОЖНЫЕ — показываем ТОЛЬКО sniff:/INJECT:/RACE:
-    is_relay_c2s = name.startswith("game:") and direction == "C2S"
-    if is_relay_c2s:
-        return None
+    # C2S opcode table из L2J Mobius частично совпадает с live Innova.
+    # Пропускаем ТОЛЬКО подтверждённые inject-ready opcodes (0xB0, 0x23, 0x40 и др.)
+    # Остальные game:C2S фильтруем — имена могут быть ложными.
+    if name.startswith("game:") and direction == "C2S":
+        _CONFIRMED_C2S = {
+            "RequestBuyItem", "RequestSellItem", "UseItem", "Action",
+            "RequestBypassToServer", "SendBypassBuildCmd",
+            "RequestEnchantItem", "MultiSellChoose",
+            "SendWareHouseDepositList", "SendWareHouseWithDrawList",
+            "AddTradeItem", "TradeDone", "TradeRequest", "AnswerTradeRequest",
+            "Say2", "RequestMagicSkillUse", "RequestRestart", "RequestRestartPoint",
+            "RequestActionUse", "RequestBuySeed", "RequestCrystallizeItem",
+            "RequestDestroyItem", "RequestHennaEquip", "RequestHennaRemove",
+            "RequestHennaItemList", "RequestHennaItemInfo",
+            "RequestPrivateStoreBuy", "RequestPrivateStoreSell",
+            "SetPrivateStoreListSell", "SetPrivateStoreListBuy",
+            "SetPrivateStoreMsgSell", "SetPrivateStoreMsgBuy",
+            "RequestPackageSend", "DlgAnswer",
+            "RequestAcquireSkill", "RequestAcquireSkillInfo",
+        }
+        clean_check = name[5:]  # strip "game:"
+        if clean_check not in _CONFIRMED_C2S:
+            return None
 
     # Извлекаем чистое имя без префиксов
     clean = name
@@ -580,7 +598,9 @@ def interpret_packet(direction: str, opcode: int, name: str, dec_hex: str) -> Op
     if clean in ("S_TELEPORT_TO_LOCATION", "TeleportToLocation"):
         return "Телепорт"
 
-    # ─── Чат (S2C Say2) ───────────────────────────────────────
+    # ─── Чат ──────────────────────────────────────────────────
+    if clean in ("Say2", "CreatureSay") and direction == "C2S":
+        return f"{prefix}Сообщение в чат"
     if clean in ("S_SAY2", "Say2", "CreatureSay") and direction == "S2C" and data and len(data) >= 10:
         # Field parse надёжен только для sniff:* (plaintext после XOR).
         # Для game:* (relay carrier_plain) поля могут быть обфусцированы.
