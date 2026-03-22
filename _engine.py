@@ -2602,6 +2602,11 @@ class WinDivertSniffer:
         # Соединения с потерянной XOR-синхронизацией (TCP gap).
         # Пересинхронизация возможна при новом S2C VERSION_CHECK (0x2E).
         self._conn_sync_lost: set = set()
+        # TCP reorder buffer: stream_key → {seq: payload}
+        # Holds out-of-order segments waiting for the missing one
+        self._ooo_buffers: Dict[tuple, dict] = {}
+        # Backup XOR cipher state before gap (for recovery)
+        self._conn_xor_backup: Dict[str, dict] = {}
 
     def _extract_tcp_payload(self, raw: bytes) -> Optional[tuple]:
         """Извлечь TCP payload из IP пакета. Возвращает (info, payload) или None."""
@@ -3117,27 +3122,75 @@ class WinDivertSniffer:
                 payload = payload[skip:]
                 payload_len = len(payload)
             elif diff > 0 and diff < 0x80000000:
-                _dbg(f"[SNIFF:7777] TCP GAP {direction} stream_key={stream_key[1]}→{stream_key[3]} "
-                     f"expected_seq={expected_seq} got_seq={tcp_seq} gap={diff} bytes")
-                self._streams.pop(stream_key, None)
-                self._stream_pkt_count.pop(stream_key, None)
-                conn_id = self._stream_conn.get(stream_key)
-                if conn_id:
-                    # Не удаляем XOR state полностью — помечаем как sync_lost.
-                    # XOR stream cipher нельзя восстановить после пропуска байт,
-                    # но мы сможем пересинхронизироваться на новом VERSION_CHECK.
-                    if conn_id not in self._conn_sync_lost:
-                        self._conn_sync_lost.add(conn_id)
-                        _dbg(f"[SNIFF:7777] XOR SYNC LOST due to TCP gap — "
-                             f"will resync on next VERSION_CHECK (0x2E)")
-                    self._conn_xor.pop(conn_id, None)
-                self._stream_next_seq[stream_key] = (tcp_seq + payload_len) & 0xFFFFFFFF
+                # ═══ TCP REORDER BUFFER ═══
+                # WinDivert может доставлять сегменты не по порядку.
+                # Вместо немедленного объявления gap — буферизуем out-of-order
+                # сегмент и ждём пропущенный (он может прийти как retransmit).
+                ooo = self._ooo_buffers.setdefault(stream_key, {})
+                ooo[tcp_seq] = payload
+                _dbg(f"[SNIFF:TCP] OOO {direction} expected={expected_seq} "
+                     f"got={tcp_seq} gap={diff}B buffered={len(ooo)} segments")
+                # Если буфер слишком большой или gap слишком широкий — объявляем потерю
+                if len(ooo) > 50 or diff > 65536:
+                    _dbg(f"[SNIFF:7777] TCP GAP CONFIRMED {direction} "
+                         f"gap={diff}B — too large for reorder")
+                    self._ooo_buffers.pop(stream_key, None)
+                    self._streams.pop(stream_key, None)
+                    self._stream_pkt_count.pop(stream_key, None)
+                    conn_id = self._stream_conn.get(stream_key)
+                    if conn_id:
+                        # Сохраняем backup cipher для возможной recovery
+                        xor_state = self._conn_xor.get(conn_id)
+                        if xor_state:
+                            self._conn_xor_backup[conn_id] = {
+                                "s2c": xor_state.get("s2c").clone() if xor_state.get("s2c") else None,
+                                "c2s": xor_state.get("c2s").clone() if xor_state.get("c2s") else None,
+                                "gap_bytes": diff,
+                            }
+                        if conn_id not in self._conn_sync_lost:
+                            self._conn_sync_lost.add(conn_id)
+                            _dbg(f"[SNIFF:7777] XOR SYNC LOST due to TCP gap — "
+                                 f"cipher backup saved for recovery")
+                        self._conn_xor.pop(conn_id, None)
+                    self._stream_next_seq[stream_key] = (tcp_seq + payload_len) & 0xFFFFFFFF
                 return
 
         # Обновляем next expected seq
         self._stream_next_seq[stream_key] = (tcp_seq + payload_len) & 0xFFFFFFFF
 
         self._pkt_count += 1
+
+        # ═══ DRAIN OOO BUFFER ═══
+        # Если есть буферизованные out-of-order сегменты — проверим,
+        # не закрыл ли текущий сегмент gap.
+        ooo = self._ooo_buffers.get(stream_key)
+        if ooo:
+            drained = True
+            while drained:
+                drained = False
+                next_exp = self._stream_next_seq.get(stream_key, 0)
+                for ooo_seq in sorted(ooo.keys()):
+                    ooo_diff = (ooo_seq - next_exp) & 0xFFFFFFFF
+                    if ooo_diff == 0:
+                        # Exact match — этот сегмент теперь по порядку!
+                        ooo_payload = ooo.pop(ooo_seq)
+                        _dbg(f"[SNIFF:TCP] OOO DRAIN {direction} seq={ooo_seq} "
+                             f"len={len(ooo_payload)} — gap filled!")
+                        self._stream_next_seq[stream_key] = \
+                            (ooo_seq + len(ooo_payload)) & 0xFFFFFFFF
+                        if stream_key not in self._streams:
+                            self._streams[stream_key] = bytearray()
+                        self._streams[stream_key].extend(ooo_payload)
+                        self._process_stream(stream_key, direction)
+                        drained = True
+                        break
+                    elif ooo_diff > 0x80000000:
+                        # Этот сегмент уже обработан (retransmit)
+                        ooo.pop(ooo_seq)
+                        drained = True
+                        break
+            if not ooo:
+                self._ooo_buffers.pop(stream_key, None)
 
         if stream_key not in self._streams:
             self._streams[stream_key] = bytearray()
