@@ -70,20 +70,76 @@ def enable_debug_priv():
 
 
 def find_module(pid, name):
+    """Find module base in 32-bit process from 64-bit Python."""
+    # Method 1: CreateToolhelp32Snapshot with TH32CS_SNAPMODULE32
     snap = kernel32.CreateToolhelp32Snapshot(0x08 | 0x10, pid)
-    if snap == ctypes.c_void_p(-1).value or snap == -1:
-        return None, None
-    me = MODULEENTRY32W()
-    me.dwSize = ctypes.sizeof(me)
-    if kernel32.Module32FirstW(snap, ctypes.byref(me)):
-        while True:
-            if me.szModule.lower() == name.lower():
-                base, size = me.modBaseAddr, me.modBaseSize
-                kernel32.CloseHandle(snap)
-                return base, size
-            if not kernel32.Module32NextW(snap, ctypes.byref(me)):
-                break
-    kernel32.CloseHandle(snap)
+    if snap and snap != ctypes.c_void_p(-1).value and snap != -1:
+        me = MODULEENTRY32W()
+        me.dwSize = ctypes.sizeof(me)
+        if kernel32.Module32FirstW(snap, ctypes.byref(me)):
+            while True:
+                if me.szModule.lower() == name.lower():
+                    base, size = me.modBaseAddr, me.modBaseSize
+                    kernel32.CloseHandle(snap)
+                    return base, size
+                if not kernel32.Module32NextW(snap, ctypes.byref(me)):
+                    break
+        kernel32.CloseHandle(snap)
+
+    # Method 2: EnumProcessModulesEx with LIST_MODULES_32BIT (for WoW64)
+    try:
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        hProc = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if not hProc:
+            return None, None
+        h_mods = (ctypes.c_void_p * 1024)()
+        cb_needed = wt.DWORD(0)
+        LIST_MODULES_32BIT = 0x01
+        ok = psapi.EnumProcessModulesEx(hProc, h_mods, ctypes.sizeof(h_mods),
+                                         ctypes.byref(cb_needed), LIST_MODULES_32BIT)
+        if ok:
+            n_mods = cb_needed.value // ctypes.sizeof(ctypes.c_void_p)
+            name_buf = ctypes.create_unicode_buffer(260)
+
+            class MODULEINFO(ctypes.Structure):
+                _fields_ = [("lpBaseOfDll", ctypes.c_void_p),
+                            ("SizeOfImage", wt.DWORD),
+                            ("EntryPoint", ctypes.c_void_p)]
+
+            mod_info = MODULEINFO()
+            for i in range(n_mods):
+                h = h_mods[i]
+                if not h:
+                    continue
+                psapi.GetModuleBaseNameW(hProc, ctypes.c_void_p(h), name_buf, 260)
+                if name_buf.value.lower() == name.lower():
+                    psapi.GetModuleInformation(hProc, ctypes.c_void_p(h),
+                                                ctypes.byref(mod_info), ctypes.sizeof(mod_info))
+                    kernel32.CloseHandle(hProc)
+                    return mod_info.lpBaseOfDll, mod_info.SizeOfImage
+        kernel32.CloseHandle(hProc)
+    except Exception as e:
+        print(f"  EnumProcessModulesEx fallback failed: {e}")
+
+    # Method 3: known base addresses (L2.exe typical layout)
+    known_bases = {
+        "core.dll": 0x15000000,
+        "nwindow.dll": 0x10000000,
+        "engine.dll": 0x20000000,
+    }
+    kb = known_bases.get(name.lower())
+    if kb:
+        try:
+            hProc = kernel32.OpenProcess(0x0010, False, pid)
+            if hProc:
+                test = rpm(hProc, kb, 2)
+                kernel32.CloseHandle(hProc)
+                if test and test[:2] == b'MZ':
+                    print(f"  {name}: using known base 0x{kb:08X}")
+                    return kb, 0x2000000  # estimate 32MB
+        except:
+            pass
+
     return None, None
 
 
@@ -203,10 +259,21 @@ def main():
         print(f"ERROR: OpenProcess failed: {ctypes.get_last_error()}")
         sys.exit(1)
 
-    # Find modules
+    # Find modules (pass handle for known-base fallback)
+    _rpm_handle_for_find = handle  # used by Method 3
+
     modules = {}
     for mod_name in ["Core.dll", "NWindow.dll", "Engine.dll"]:
         base, size = find_module(pid, mod_name)
+        # Method 3 fallback: try known base with our handle
+        if not base:
+            known = {"core.dll": 0x15000000, "nwindow.dll": 0x10000000, "engine.dll": 0x20000000}
+            kb = known.get(mod_name.lower())
+            if kb:
+                test = rpm(handle, kb, 2)
+                if test and test[:2] == b'MZ':
+                    base, size = kb, 0x2000000
+                    print(f"  {mod_name}: fallback to known base 0x{kb:08X}")
         if base:
             modules[mod_name] = {"base": base, "size": size}
             print(f"{mod_name}: base=0x{base:08X} size=0x{size:08X}")
