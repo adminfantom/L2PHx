@@ -113,6 +113,9 @@ _GAME_CAP = {
     "_seen_hashes": set(), # для дедупликации
 }
 
+# State for l2_identify_action MCP tool
+_IDENTIFY_STATE = {"active": False, "start_seq": 0, "label": "", "start_ts": ""}
+
 
 def _dbg(msg: str):
     """Пишет отладочное сообщение в DEBUG_FILE и stderr."""
@@ -4129,6 +4132,18 @@ class L2McpServer:
                   count={"type": "integer", "default": 100,
                          "description": "Макс. пакетов для анализа"},
               )),
+            T(name="l2_identify_action",
+              description="Runtime opcode identification — записать снимок пакетов "
+                          "ДО и ПОСЛЕ выполнения действия в игре. "
+                          "Использование: 1) вызвать с mode='start', 2) выполнить действие в игре, "
+                          "3) вызвать с mode='stop'. Покажет все C2S и S2C пакеты между start/stop. "
+                          "Это позволяет определить РЕАЛЬНЫЕ opcodes на live Innova сервере.",
+              inputSchema=_schema(
+                  mode={"type": "string", "enum": ["start", "stop", "status"],
+                        "description": "start=начать запись, stop=показать результат, status=текущий статус"},
+                  label={"type": "string", "default": "",
+                         "description": "Метка действия (напр. 'покупка_в_лавке')"},
+              )),
             T(name="l2_trade_request",
               description="TradeRequest (0x1A) — инициировать обмен с игроком.",
               inputSchema=_schema(
@@ -4475,6 +4490,62 @@ class L2McpServer:
                 "ex_opcodes": ex, "ex_count": len(ex),
                 "custom_main": custom_main, "custom_ex": custom_ex,
             }
+
+        if name == "l2_identify_action":
+            mode = args.get("mode", "status")
+            label = args.get("label", "")
+            if mode == "start":
+                _IDENTIFY_STATE["active"] = True
+                _IDENTIFY_STATE["start_seq"] = self.store.seq
+                _IDENTIFY_STATE["label"] = label
+                _IDENTIFY_STATE["start_ts"] = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                return {"status": "recording", "start_seq": _IDENTIFY_STATE["start_seq"],
+                        "label": label, "message": "Запись начата. Выполните действие в игре, затем вызовите с mode='stop'."}
+            elif mode == "stop":
+                if not _IDENTIFY_STATE.get("active"):
+                    return {"error": "Запись не была начата. Сначала вызовите с mode='start'."}
+                start_seq = _IDENTIFY_STATE["start_seq"]
+                _IDENTIFY_STATE["active"] = False
+                end_seq = self.store.seq
+                # Collect all non-padding game packets between start and end
+                c2s_pkts = []
+                s2c_pkts = []
+                for pkt in self.store.packets:
+                    seq = pkt.get("seq", 0)
+                    if seq <= start_seq or seq > end_seq:
+                        continue
+                    opname = pkt.get("opname", "")
+                    extra = pkt.get("extra", {})
+                    if extra.get("is_padding"):
+                        continue
+                    if not opname.startswith("game:") and not opname.startswith("sniff:"):
+                        continue
+                    entry = {
+                        "seq": seq, "dir": pkt.get("dir"),
+                        "opcode": f"0x{pkt.get('opcode', 0):04X}",
+                        "opname": opname,
+                        "size": pkt.get("len", 0),
+                        "hex_preview": pkt.get("dec_hex", "")[:64],
+                    }
+                    if pkt.get("dir") == "C2S":
+                        c2s_pkts.append(entry)
+                    else:
+                        s2c_pkts.append(entry)
+                return {
+                    "label": _IDENTIFY_STATE.get("label", ""),
+                    "start_seq": start_seq, "end_seq": end_seq,
+                    "start_ts": _IDENTIFY_STATE.get("start_ts", ""),
+                    "c2s_count": len(c2s_pkts), "s2c_count": len(s2c_pkts),
+                    "c2s_packets": c2s_pkts[:50],
+                    "s2c_packets": s2c_pkts[:50],
+                    "summary": f"Записано {len(c2s_pkts)} C2S + {len(s2c_pkts)} S2C пакетов за действие '{_IDENTIFY_STATE.get('label', '')}'",
+                }
+            else:  # status
+                return {
+                    "active": _IDENTIFY_STATE.get("active", False),
+                    "start_seq": _IDENTIFY_STATE.get("start_seq", 0),
+                    "label": _IDENTIFY_STATE.get("label", ""),
+                }
 
         if name == "l2_get_workflow_context":
             # Последние N game:* пакетов сгруппированные по workflow-эпизодам
